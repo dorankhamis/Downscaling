@@ -1,3 +1,10 @@
+# lotus batch files
+*.err
+*.out
+
+# NN weights/checkpoints
+*.pth
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

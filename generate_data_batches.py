@@ -3,37 +3,30 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import glob
-#import tensorflow as tf
 import argparse
 
-import setupdata
+import setupdata3 as sd
 from soil_moisture.utils import zeropad_strint
+from params import data_pars as dp
 
-
-def main(run_n, batch_type,
-         train_years, val_years, heldout_years,
-         dim_l, res, scale):
+def main(run_n, batch_type):
     try:
         yr_ind = run_n // 12
         mn_ind = run_n % 12
         if batch_type=='train':
-            year = train_years[yr_ind]
+            year = dp.train_years[yr_ind]
         elif batch_type=='val':
-            year = val_years[yr_ind]
+            year = dp.val_years[yr_ind]
         else:
-            year = heldout_years[yr_ind]
+            year = dp.heldout_years[yr_ind]
         month = zeropad_strint(mn_ind+1)
-        possible_files = glob.glob(f'{setupdata.era5_fldr}/t2m/era5_{year}{month}*_t2m.nc')
+        possible_files = glob.glob(f'{sd.era5_fldr}/t2m/era5_{year}{month}*_t2m.nc')
         datestrings = [f.split('era5_')[-1].split('_')[0] for f in possible_files]
     except:
         return 1
 
-    datagen = setupdata.data_generator(        
-        train_years, val_years, heldout_years,
-        dim_l=dim_l, res=res, scale=scale
-    )
-
-    batch_outpath = setupdata.binary_batch_path + f'/{batch_type}_batches/'
+    datagen = sd.data_generator()
+    batch_outpath = sd.binary_batch_path + f'/{batch_type}_batches/'
     Path(batch_outpath).mkdir(parents=True, exist_ok=True)
 
     for ds in datestrings:
@@ -50,15 +43,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run_n = int(args.run_n)
     batch_type = str(args.batch_type)
-    
-    dim_l = 4 # number of raw ERA5 pixels in each dim to take
-    res = 25000 # or raw ERA5 in metres
-    scale = 25 # how much we are downscaling
-    train_years = [2015, 2016, 2017, 2018]
-    val_years = [2019, 2020]
-    heldout_years = [2021]
-    
-    main(run_n, batch_type,
-         train_years, val_years, heldout_years,
-         dim_l, res, scale)
+        
+    main(run_n, batch_type)
         

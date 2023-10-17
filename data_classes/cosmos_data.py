@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import glob
 
-from soil_moisture.utils import preprocess, data_dir
+from soil_moisture.utils import replace_missing, indexify_datetime, data_dir
 fldr = data_dir + '/COSMOS/'
 
 
@@ -23,42 +23,33 @@ class CosmosData():
         self.qc_flags = pd.read_csv(glob.glob(fldr + '/QC_flags/COSMOS-UK_' + self.SID + '_HydroSoil_SH_*_QC_Flags.csv')[0])
     
     def read_daily(self):
-        self.daily = pd.read_csv(glob.glob(fldr + '/daily/COSMOS-UK_' + self.SID + '_HydroSoil_Daily_*.csv')[0])
+        self.daily = pd.read_csv(glob.glob(fldr + '/daily/COSMOS-UK_' + self.SID + '_HydroSoil_Daily*.csv')[0])
   
     def read_hourly(self):
-        self.hourly = pd.read_csv(glob.glob(fldr + '/hourly/COSMOS-UK_' + self.SID + '_HydroSoil_Hourly_*.csv')[0])
+        self.hourly = pd.read_csv(glob.glob(fldr + '/hourly/COSMOS-UK_' + self.SID + '_HydroSoil_Hourly*.csv')[0])
   
     def read_subhourly(self):
-        self.subhourly = pd.read_csv(glob.glob(fldr + '/subhourly/COSMOS-UK_' + self.SID + '_HydroSoil_SH_*.csv')[0])
+        self.subhourly = pd.read_csv(glob.glob(fldr + '/subhourly/COSMOS-UK_' + self.SID + '_HydroSoil_SH*.csv')[0])
       
-    def preprocess_all(self, missing_val=np.nan, dt_name='DATE_TIME', use_qc_flags=False):
-        try:
-            self.daily = preprocess(self.daily, missing_val, dt_name, add_stamp='T00:00:00Z')
-        except:
-            print(f'Failed to preprocess daily for {self.SID}')
-        try:
-            self.hourly = preprocess(self.hourly, missing_val, dt_name)
-        except:
-            print(f'Failed to preprocess hourly for {self.SID}')
-        try:
-            if use_qc_flags is True:
-                self.read_QC_flags()
-                cl = self.qc_flags.columns[2:]
-                clv = self.subhourly.columns[2:]
-                clmap = {oldname:oldname[:-7] for oldname in cl}
-                mask = self.qc_flags.loc[:, cl] != 0.
-                self.subhourly.loc[:, clv][mask.rename(columns = clmap)] = missing_val                
-            self.subhourly = preprocess(self.subhourly, missing_val, dt_name)
-        except:
-            print(f'Failed to preprocess subhourly for {self.SID}')
-        try:
+    def preprocess_all(self, missing_val= -9999.0, dt_name='DATE_TIME', use_qc_flags=False):
+        if not self.daily is None:
+            self.daily = replace_missing(self.daily, missing_val)
+            self.daily = indexify_datetime(self.daily, dt_name, drop=True, utc=True)
+
+        if not self.hourly is None:
+            self.hourly = replace_missing(self.hourly, missing_val)
+            self.hourly = indexify_datetime(self.hourly, dt_name, drop=True, utc=True)
+        
+        if not self.subhourly is None:
+            self.subhourly = replace_missing(self.subhourly, missing_val)
+            self.subhourly = indexify_datetime(self.subhourly, dt_name, drop=True, utc=True)
+
             self.subhourly.loc[self.subhourly['SWIN']<0, 'SWIN'] = 0 # cannot have negative
             self.subhourly.loc[self.subhourly['SWOUT']<0, 'SWOUT'] = 0 # cannot have negative
             self.subhourly.loc[self.subhourly['LWIN']<0, 'LWIN'] = 0 # cannot have negative
             self.subhourly.loc[self.subhourly['LWOUT']<0, 'LWOUT'] = 0 # cannot have negative
             self.subhourly['TA'] = self.subhourly['TA'] + 273.15 # convert to Kelvin to remove -ve
-        except:
-            pass
+
     
     
 class CosmosMetaData():

@@ -16,6 +16,9 @@
 # NN weights/checkpoints
 *.pth
 
+# output / data
+*.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

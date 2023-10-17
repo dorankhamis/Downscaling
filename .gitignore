@@ -2,6 +2,17 @@
 *.err
 *.out
 
+# plots / images
+*.png
+*.jpeg
+*.jpg
+*.pdf
+*.eps
+
+# binary
+*.npy
+*.pkl
+
 # NN weights/checkpoints
 *.pth
 

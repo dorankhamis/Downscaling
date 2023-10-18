@@ -213,7 +213,7 @@ if __name__=="__main__":
         binary_masks = False
         results = pd.DataFrame()
         #for dist_lim in [1, 10, 50, 100, 200, 400, 800]:
-        for dist_lim in len(list(range(10,210,10))):
+        for dist_lim in list(range(10,210,10)):
             
             dist_lim_far = dist_lim + 50
             

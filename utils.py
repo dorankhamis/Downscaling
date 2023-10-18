@@ -193,8 +193,8 @@ def build_binary_masks(distances, scale_factors, dist_lim_far, device):
 
 def prepare_attn(model, batch, site_meta, fine_grid,
                  context_sites=None, b=0,
-                 dist_lim=150, dist_lim_far=250,
-                 attn_eps=1e-4, poly_exp=1.5,
+                 dist_lim=80, dist_lim_far=130,
+                 attn_eps=1e-6, poly_exp=4,
                  diminish_model="gaussian"):
     # create the flat YX grid for attention
     raw_H = batch.fine_inputs.shape[-2]

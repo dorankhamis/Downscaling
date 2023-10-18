@@ -12,7 +12,8 @@ from torch.optim import Adam
 from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
 
-from setupdata3 import data_generator, Batch, create_chess_pred, load_process_chess
+from setupdata3 import (data_generator, Batch, create_chess_pred,
+                        load_process_chess, interp_to_grid, reflect_pad_nans)
 from model2 import MetVAE, SimpleDownscaler
 from params import data_pars, model_pars, train_pars
 from loss_funcs2 import make_loss_func
@@ -39,7 +40,7 @@ if __name__=="__main__":
         year = int(args.year)        
         day = int(args.day)
     except: # not running as batch script        
-        year = 2017
+        year = 2015
         day = 0
     
     ## output directory, shared by variables and hourly/daily data
@@ -52,61 +53,7 @@ if __name__=="__main__":
     removed_sites = np.setdiff1d(datgen.train_sites, context_sites.SITE_ID.values)
     datgen.train_sites = list(np.setdiff1d(datgen.train_sites, removed_sites))
     datgen.heldout_sites += list(removed_sites)
-       
-    # get dummy batch
-    dummyvar = 'WS'
-    batch = datgen.get_all_space(dummyvar, batch_type='train',
-                                 load_binary_batch=False,
-                                 context_frac=1,
-                                 date_string="20170101",
-                                 it=1,
-                                 timestep='hourly',
-                                 tile=False)
-    
-    # and dummy model
-    dummymodel = SimpleDownscaler(
-        input_channels=batch['coarse_inputs'].shape[1],
-        hires_fields=batch['fine_inputs'].shape[1],
-        output_channels=batch['coarse_inputs'].shape[1],
-        context_channels=batch['station_data'][0].shape[1],
-        filters=model_pars.filters,
-        dropout_rate=model_pars.dropout_rate,
-        scale=data_pars.scale,
-        scale_factor=model_pars.scale_factor,
-        attn_heads=model_pars.attn_heads,
-        ds_cross_attn=model_pars.ds_cross_attn,
-        pe=model_pars.pe
-    )
-    
-    batch = Batch(batch, var_list=dummyvar, device=device, constraints=False)
 
-    # prepare bits for grid point attention
-    dist_lim = 100 # 100
-    dist_lim_far = 150 # 150
-    attn_eps = 1e-6 # 1e-6
-    poly_exp = 4.
-    diminish_model = "gaussian" #["gaussian", "polynomial"]
-    pass_exp = 1. # 1.
-    dist_pixpass = 120 # 100
-    soft_masks = True
-    pixel_pass_masks = True
-    binary_masks = False
-    b = 0
-    distances, softmask, scale_factors, site_yx = prepare_attn(
-        model,
-        batch,
-        datgen.site_metadata,
-        datgen.fine_grid,
-        b=b,
-        dist_lim=dist_lim,
-        dist_lim_far=dist_lim_far,
-        attn_eps=attn_eps,
-        poly_exp=poly_exp,
-        diminish_model=diminish_model
-    )
-    del(dummymodel)
-    del(batch)
-    
     # save an index column for ordered recall later (s_idx)
     context_sites = (context_sites.reset_index(drop=True)
         .assign(s_idx = np.arange(context_sites.shape[0]))
@@ -182,10 +129,24 @@ if __name__=="__main__":
             model.eval()
 
             it = list(np.arange(24))
+            tstamps = [curr_date + datetime.timedelta(hours=int(dt)) for dt in it]
             tile = False
             p_hourly = 1
             max_batch_size = 1        
             context_frac = 1
+            
+            # attn params
+            dist_lim = 80 # mean==80 but could load var specific vals?
+            dist_lim_far = dist_lim + 50
+            dist_pixpass = 100
+            attn_eps = 1e-6
+            poly_exp = 4.
+            diminish_model = "gaussian" # ["gaussian", "polynomial"]
+            pass_exp = 1.
+            soft_masks = True
+            pixel_pass_masks = True
+            binary_masks = False
+            
             daily_results = pd.DataFrame()
             hourly_results = pd.DataFrame()
             if var=='TA': dtr_daily_results = pd.DataFrame()
@@ -200,9 +161,7 @@ if __name__=="__main__":
                                          date_string=date_string,
                                          it=it,
                                          timestep='hourly',
-                                         tile=tile)
-            ixs = batch['ixs']
-            iys = batch['iys']
+                                         tile=tile)            
             
             print(var)
             print(date_string)
@@ -216,39 +175,81 @@ if __name__=="__main__":
             pred_era5 = []
             while ii<batch.coarse_inputs.shape[0]:
                 iinext = min(ii+max_batch_size, batch.coarse_inputs.shape[0])
-                # because we throttle at batch size of 1, we don't need to 
-                # worry about padding attention masks / context data
+
+                distances, softmask, scale_factors, site_yx = prepare_attn(
+                    model,
+                    batch,
+                    datgen.site_metadata,
+                    datgen.fine_grid,
+                    context_sites=None,
+                    b=ii,
+                    dist_lim=dist_lim,
+                    dist_lim_far=dist_lim_far,
+                    attn_eps=attn_eps,
+                    poly_exp=poly_exp,
+                    diminish_model=diminish_model
+                )
                 
-                # actually subset distances / softmasks and create masks anew here
-                # batch_elem_masks = subset_context_masks(batch,
-                                                        # cntxt_stats,
-                                                        # masks['context_soft_masks'],
-                                                        # b=ii)
-                bsites = np.array(batch.raw_station_dict[ii]['context'].index)                
-                s_idxs = context_sites.loc[bsites].s_idx.values
-                sub_dists = distances[:,s_idxs,:,:] # approx
-                sub_softmasks = softmask[:,s_idxs,:,:] # approx
-                masks = {}
+                masks = {
+                    'context_soft_masks':[None,None,None,None],
+                    'pixel_passers':     [None,None,None,None],
+                    'context_masks':     [None,None,None,None]
+                }
                 if soft_masks:
-                    masks['context_soft_masks'] = build_soft_masks(sub_softmasks, scale_factors, device)
+                    masks['context_soft_masks'] = build_soft_masks(softmask, scale_factors, device)
                 if pixel_pass_masks:        
-                    masks['pixel_passers'] = build_pixel_passers(sub_dists, scale_factors, dist_lim_far, pass_exp, device)
+                    masks['pixel_passers'] = build_pixel_passers(distances, scale_factors, dist_pixpass, pass_exp, device)
                     # reshaping is done in the model...
                 if binary_masks:
-                    masks['context_masks'] = build_binary_masks(sub_dists, scale_factors, dist_lim_far, device)
-                                                        
+                    masks['context_masks'] = build_binary_masks(distances, scale_factors, dist_lim_far, device)
                 
                 with torch.no_grad():
                     out = model(batch.coarse_inputs[ii:iinext,...],
                                 batch.fine_inputs[ii:iinext,...],
                                 batch.context_data[ii:iinext],
                                 batch.context_locs[ii:iinext],
+                                context_masks=masks['context_masks'],
                                 context_soft_masks=masks['context_soft_masks'],
-                                pixel_passer=masks['pixel_passers'])                                
+                                pixel_passer=masks['pixel_passers'])    
                     out2 = model(batch2.coarse_inputs[ii:iinext,...],
-                                batch2.fine_inputs[ii:iinext,...],
-                                batch2.context_data[ii:iinext],
-                                batch2.context_locs[ii:iinext])    
+                                 batch2.fine_inputs[ii:iinext,...],
+                                 batch2.context_data[ii:iinext],
+                                 batch2.context_locs[ii:iinext])                
+  
+                # iinext = min(ii+max_batch_size, batch.coarse_inputs.shape[0])
+                # # because we throttle at batch size of 1, we don't need to 
+                # # worry about padding attention masks / context data
+                
+                # # actually subset distances / softmasks and create masks anew here
+                # # batch_elem_masks = subset_context_masks(batch,
+                                                        # # cntxt_stats,
+                                                        # # masks['context_soft_masks'],
+                                                        # # b=ii)
+                # bsites = np.array(batch.raw_station_dict[ii]['context'].index)                
+                # s_idxs = context_sites.loc[bsites].s_idx.values
+                # sub_dists = distances[:,s_idxs,:,:] # approx
+                # sub_softmasks = softmask[:,s_idxs,:,:] # approx
+                # masks = {}
+                # if soft_masks:
+                    # masks['context_soft_masks'] = build_soft_masks(sub_softmasks, scale_factors, device)
+                # if pixel_pass_masks:        
+                    # masks['pixel_passers'] = build_pixel_passers(sub_dists, scale_factors, dist_lim_far, pass_exp, device)
+                    # # reshaping is done in the model...
+                # if binary_masks:
+                    # masks['context_masks'] = build_binary_masks(sub_dists, scale_factors, dist_lim_far, device)
+                                                        
+                
+                # with torch.no_grad():
+                    # out = model(batch.coarse_inputs[ii:iinext,...],
+                                # batch.fine_inputs[ii:iinext,...],
+                                # batch.context_data[ii:iinext],
+                                # batch.context_locs[ii:iinext],
+                                # context_soft_masks=masks['context_soft_masks'],
+                                # pixel_passer=masks['pixel_passers'])                                
+                    # out2 = model(batch2.coarse_inputs[ii:iinext,...],
+                                # batch2.fine_inputs[ii:iinext,...],
+                                # batch2.context_data[ii:iinext],
+                                # batch2.context_locs[ii:iinext])    
                 pred.append(out.cpu())
                 pred2.append(out2.cpu())
                 del(out)
@@ -259,19 +260,19 @@ if __name__=="__main__":
                     datgen.var_name_map.loc[var].coarse][ii,:,:],
                     datgen.fine_grid, coords=['lat', 'lon'])
                 era5_interp = reflect_pad_nans(era5_interp)
-                pred_era5.eppend(era5_interp.values[None, None, ...].cpu())
+                pred_era5.append(era5_interp.values[None, None, ...])
                 
                 ii += max_batch_size
             pred = torch.cat(pred, dim=0).numpy()
             pred_dayav = pred.mean(axis=0)
             pred2 = torch.cat(pred2, dim=0).numpy()
             pred2_dayav = pred2.mean(axis=0)
-            pred_era5 = torch.cat(pred_era5, dim=0).numpy()
+            pred_era5 = np.concatenate(pred_era5, axis=0)
             pred_era5_dayav = pred_era5.mean(axis=0)
             del(batch2)
             
             ''' also output the day and night averages for each var
-            and  day, night length in hours '''
+            and day, night length in hours? '''
                                    
             # also create a chess batch for comparison
             chess_var = datgen.var_name_map.loc[var].chess
@@ -287,8 +288,7 @@ if __name__=="__main__":
                 # also load chess daily temperature range
                 pred_cdtr = load_process_chess(datgen.td.year, datgen.td.month, datgen.td.day,
                                                'dtr', normalise=True)
-                # pred_cdtr = pred_cdtr['dtr'].values[:(-(len(pred_cdtr.y) - pred.shape[-2])),
-                                                    # :(-(len(pred_cdtr.x) - pred.shape[-1]))]
+                
                 pred_cdtr = pred_cdtr['dtr'].values
                 # pad to new size                
                 pred_cdtr = np.hstack([pred_cdtr, np.ones((pred_cdtr.shape[0], pred.shape[-1] - pred_cdtr.shape[-1]))*np.nan])
@@ -340,7 +340,7 @@ if __name__=="__main__":
             daily_results.to_csv(dd_out, index=False)
 
             if var=='TA':
-                ''' add daily temperature range retrieval from sites here '''
+                ''' add daily temperature range retrieval from sites here'''
                 tmax = hourly_data[['SITE_ID', 'TA']].groupby('SITE_ID').agg(np.nanmax)
                 tmin = hourly_data[['SITE_ID', 'TA']].groupby('SITE_ID').agg(np.nanmin)
                 site_trange = tmax - tmin
@@ -368,7 +368,6 @@ if __name__=="__main__":
             site_preds_h = pred[:, 0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
             site_preds2_h = pred2[:, 0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
             site_preds_era5_h = pred_era5[:, 0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
-            tstamps = [curr_date + datetime.timedelta(hours=dt) for dt in range(24)]
 
             del(pred)
             del(pred2)
@@ -377,17 +376,23 @@ if __name__=="__main__":
             site_preds_h = pd.DataFrame(site_preds_h)
             site_preds_h.columns = daily_data.SITE_ID.values
             site_preds_h = site_preds_h.assign(DATE_TIME = tstamps)            
-            site_preds_h = site_preds_h.melt(id_vars='DATE_TIME', var_name='SITE_ID', value_name='pred_model')
+            site_preds_h = site_preds_h.melt(id_vars='DATE_TIME',
+                                             var_name='SITE_ID',
+                                             value_name='pred_model')
             
             site_preds2_h = pd.DataFrame(site_preds2_h)
             site_preds2_h.columns = daily_data.SITE_ID.values
-            site_preds2_h = site_preds2_h.assign(DATE_TIME = tstamps)            
-            site_preds2_h = site_preds2_h.melt(id_vars='DATE_TIME', var_name='SITE_ID', value_name='pred_model_nc')
+            site_preds2_h = site_preds2_h.assign(DATE_TIME = tstamps)
+            site_preds2_h = site_preds2_h.melt(id_vars='DATE_TIME',
+                                               var_name='SITE_ID',
+                                               value_name='pred_model_nc')
             
             site_preds_era5_h = pd.DataFrame(site_preds_era5_h)
             site_preds_era5_h.columns = daily_data.SITE_ID.values
-            site_preds_era5_h = site_preds_era5_h.assign(DATE_TIME = tstamps)            
-            site_preds_era5_h = site_preds_era5_h.melt(id_vars='DATE_TIME', var_name='SITE_ID', value_name='pred_era5_interp')
+            site_preds_era5_h = site_preds_era5_h.assign(DATE_TIME = tstamps)
+            site_preds_era5_h = site_preds_era5_h.melt(id_vars='DATE_TIME',
+                                                       var_name='SITE_ID',
+                                                       value_name='pred_era5_interp')
             
             hourly_res = (site_preds_h
                 .merge(site_preds2_h, on=['DATE_TIME', 'SITE_ID'], how='left')

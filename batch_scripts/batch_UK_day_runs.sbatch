@@ -9,6 +9,6 @@
 #SBATCH --array=0-365
 
 source /home/users/doran/software/envs/pytorch/bin/activate
-python ../run_UK_tests_day.py 2019 ${SLURM_ARRAY_TASK_ID}
+python ../run_UK_tests_day.py 2015 ${SLURM_ARRAY_TASK_ID}
 
 

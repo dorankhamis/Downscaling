@@ -1,6 +1,7 @@
 #!/bin/bash 
 #SBATCH --partition=short-serial-4hr
 #SBATCH --account=short4hr
+####SBATCH --partition=short-serial
 #SBATCH --job-name=UK_dayruns
 #SBATCH -o %A_%a.out
 #SBATCH -e %A_%a.err

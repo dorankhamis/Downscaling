@@ -9,7 +9,6 @@ from inspect import isfunction
 from utils import find_num_pools, decide_scale_factor
 
 ## some code from https://github.com/Janspiry/Palette-Image-to-Image-Diffusion-Models/blob/main/models/sr3_modules/unet.py
-EPS = 1e-30
 
 def clones(module, N):
     "Produce N identical layers."
@@ -435,7 +434,7 @@ def attention(query, key, value, mask=None, softmask=None, dropout=None):
         #if scores.max() > 70:
         #    print('potential exp overflow in attn score softmasking')        
         #scores = torch.log(torch.exp(scores) * softmask)
-        scores = scores + torch.log(softmask + EPS)
+        scores = scores + softmask # log already taken in mask creation
     elif mask is not None:        
         scores = scores.masked_fill(mask == 0, -1e9)
     
@@ -456,10 +455,22 @@ class Attention1D(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)        
         
-    def forward(self, query, key, value, mask=None, softmask=None, pixel_passer=None):
-        # Same mask applied to all h heads.
+    def forward(self, query, key, value,
+                mask=None, softmask=None, pixel_passer=None):
+        # Same mask applied to all h heads...
+        # unless we use the ALibi reducing m_factor
         if softmask is not None:
-            softmask = softmask.unsqueeze(1)
+            # if not ALibi just unsqueeze the head dimension:
+            #softmask = softmask.unsqueeze(1)
+            
+            # if ALibi, multiply each head by decreasng m_factor:
+            sizes = list(softmask.shape)
+            sizes.insert(1, self.h)
+            use_softmask = torch.zeros(tuple(sizes), dtype=torch.float32).to(softmask.device)
+            m_factors = [1/2**n for n in range(self.h)]
+            for hh in range(self.h):
+                use_softmask[:,hh,...] = use_softmask[:,hh,...] * m_factors[hh]
+            softmask = use_softmask
         elif mask is not None:            
             mask = mask.unsqueeze(1)
             

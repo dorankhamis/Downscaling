@@ -6,32 +6,61 @@ import pkbar
 import datetime
 
 from setupdata3 import Batch
-from utils import save_checkpoint, prepare_run, make_mask_list_from_filters
+from utils import save_checkpoint, prepare_run, create_attention_masks
 from params import data_pars as dps, train_pars, model_pars as mps
 
 batch_quantiles_path = '/gws/nopw/j04/ceh_generic/netzero/downscaling/training_data/var_quantile_samples/'
 
-def model_step(model, batch, loglikelihood, null_stations=False):
+def model_step(model, batch, loglikelihood, var=None):
+    # prepare attention masks
+    masks = create_attention_masks(model, batch, var)
+    
     # run data through model
-    pred = model(batch.coarse_inputs, batch.fine_inputs,
-                  batch.context_data, batch.context_locs)
+    pred = model(
+        batch.coarse_inputs,
+        batch.fine_inputs,
+        batch.context_data,
+        batch.context_locs,
+        context_masks=masks['context_masks'],
+        context_soft_masks=masks['context_soft_masks'],
+        pixel_passer=masks['pixel_passers']
+    )
+    
+    # run data through model with no context sites
+    batch2 = create_null_batch(batch)
+    pred2 = model(batch2.coarse_inputs, batch2.fine_inputs,
+                  batch2.context_data, batch2.context_locs)
+    
+    clip_output = False
+    if type(var)==list:
+        if ('SWIN' in var) or ('PRECIP' in var):
+            clip_output = True
+    elif type(var)==str:
+        if (var=='SWIN') or (var=='PRECIP'):
+            clip_output = True
+    if clip_output:
+        pred = nn.functional.relu(pred) # cannot be negative
+        pred2 = nn.functional.relu(pred2) # cannot be negative
             
     # calculate log likelihood, trimming edge pixels at coarse scale
-    loss_dict = loglikelihood(pred, batch, null_stations=null_stations)        
-    loglik = sum(loss_dict.values())
+    loss_dict = loglikelihood(pred, batch, null_stations=False)
+    loss_dict_null = loglikelihood(pred2, batch, null_stations=True)
+    loglik = 0.6 * sum(loss_dict.values()) + 0.4 * sum(loss_dict_null.values())
     
     # add vars to loss dict and return
     loss_dict['nll'] = -loglik
-    loss_dict['loglikelihood'] = loglik    
+    loss_dict['loglikelihood'] = loglik
+    for k in loss_dict_null:
+        if not 'station' in k:
+            loss_dict[k+'_nc'] = loss_dict_null[k]
     return loss_dict
 
 def make_train_step(model, optimizer, loglikelihood):
-    def train_step(batch, null_stations=False):        
+    def train_step(batch, var=None):
         model.train()
         
         # take step        
-        losses = model_step(model, batch, loglikelihood,                            
-                            null_stations=null_stations)
+        losses = model_step(model, batch, loglikelihood, var=var)
         
         # propagate derivatives        
         losses['nll'].backward()
@@ -43,13 +72,12 @@ def make_train_step(model, optimizer, loglikelihood):
     return train_step
 
 def make_val_step(model, loglikelihood):
-    def val_step(batch, null_stations=False):
+    def val_step(batch, var=None):
         model.eval()
              
         with torch.no_grad():
             # take step
-            losses = model_step(model, batch, loglikelihood,                                
-                                null_stations=null_stations)
+            losses = model_step(model, batch, loglikelihood, var=var)
         
         return {k:losses[k].item() for k in losses}
     
@@ -88,8 +116,27 @@ def read_qbin(var, nbin, batch_type='train'):
     return pd.read_pickle(batch_quantiles_path + f'/{var}_bin_{nbin}_{batch_type}.pkl',
                           compression={'method': 'gzip', 'compresslevel': 5})
 
+def quantile_bin_choice(bin_dict, qkeys, q_ind, nqbins, num_q_samples, batch_type='train'):
+    # choose a quantile bin to extract samples from
+    vv, nb = bin_dict[qkeys[q_ind % nqbins]]
+    bin_samples = read_qbin(vv, nb, batch_type=batch_type)
+    maxii = bin_samples.shape[0]
+    ii = np.random.randint(low=0, high=maxii)
+    this_sample = bin_samples.iloc[ii:(ii+1)]
+    other_samples = bin_samples[
+        bin_samples['DATE_TIME'].dt.date == this_sample.DATE_TIME.dt.date.values[0]
+    ]
+    n_samp = max(1, min(num_q_samples, other_samples.shape[0]))
+    other_samples = other_samples.sample(n_samp)
+    date = this_sample.DATE_TIME.dt.date.values[0]
+    parent_pixel_ids = list(other_samples.parent_pixel_id)
+    times = list(other_samples.DATE_TIME.dt.hour)
+    if (q_ind % nqbins)==(nqbins-1): np.random.shuffle(qkeys)
+    q_ind += 1
+    return date, times, parent_pixel_ids, qkeys, q_ind
+
 def fit(model, optimizer, loglikelihood, var, datgen, 
-        batch_prob_hourly, LR_scheduler=None, null_batch_prob=0.5,
+        batch_prob_hourly, LR_scheduler=None,
         outdir='/logs/', checkpoint=None, device=None):
     ## setup
     if device is None:
@@ -115,42 +162,22 @@ def fit(model, optimizer, loglikelihood, var, datgen,
         kbar = pkbar.Kbar(target=train_pars.train_len, epoch=epoch,
                           num_epochs=train_pars.max_epochs,
                           width=15, always_stateful=False)
-        p_hourly = batch_prob_hourly[epoch]
+        p_hourly = 1 #batch_prob_hourly[epoch]
         running_ls = None
         q_ind = 0
         np.random.shuffle(qkeys)
         for bidx in range(1, train_pars.train_len+1):
-            null_stations = False
-            context_frac = None
-            if np.random.uniform() < null_batch_prob:                
-                null_stations = True
-                context_frac = 0
-
-            if not null_stations:
-                # choose a quantile bin tp extract samples from
-                vv, nb = bin_dict[qkeys[q_ind % nqbins]]
-                bin_samples = read_qbin(vv, nb, batch_type='train')
-                maxii = bin_samples.shape[0]
-                ii = np.random.randint(low=0, high=maxii)
-                this_sample = bin_samples.iloc[ii:(ii+1)]
-                other_samples = bin_samples[bin_samples['DATE_TIME'].dt.date == this_sample.DATE_TIME.dt.date.values[0]]
-                n_samp = max(1, min(num_q_samples, other_samples.shape[0]))
-                other_samples = other_samples.sample(n_samp)
-                date = this_sample.DATE_TIME.dt.date.values[0]
-                parent_pixel_ids = list(other_samples.parent_pixel_id)
-                times = list(other_samples.DATE_TIME.dt.hour)
-                if (q_ind % nqbins)==(nqbins-1): np.random.shuffle(qkeys)
-                q_ind += 1
-            else:
-                date = None
-                parent_pixel_ids = []
-                times = []
+            context_frac = None # sample randomly each time
+ 
+            # choose a quantile bin to extract samples from
+            date, times, parent_pixel_ids, qkeys, q_ind = quantile_bin_choice(
+                bin_dict, qkeys, q_ind, nqbins, num_q_samples, batch_type='train'
+            )
                 
             batch = datgen.get_batch(
                 var,
                 batch_size=train_pars.batch_size,
                 batch_type='train',
-                load_binary_batch=False,
                 context_frac=context_frac,
                 p_hourly=p_hourly,
                 date=date,
@@ -159,7 +186,7 @@ def fit(model, optimizer, loglikelihood, var, datgen,
             )
             batch = Batch(batch, var_list=var, device=device)
                         
-            loss_dict = train_step(batch, null_stations=null_stations)
+            loss_dict = train_step(batch, var=var)
             running_ls = update_running_loss(running_ls, loss_dict)
             
             print_values = [(key, running_ls[key][-1]) for key in running_ls]
@@ -179,43 +206,24 @@ def fit(model, optimizer, loglikelihood, var, datgen,
             q_ind = 0
             np.random.shuffle(qkeys)
             for bidx in range(1, train_pars.val_len+1):
-                null_stations = False
                 context_frac = 0.75 # fix constant for more stable validation?
-                if np.random.uniform() < null_batch_prob:                
-                    null_stations = True
-                    context_frac = 0
-                
-                if not null_stations:
-                    # choose a quantile bin tp extract samples from
-                    vv, nb = bin_dict[qkeys[q_ind % nqbins]]
-                    bin_samples = read_qbin(vv, nb, batch_type='val')
-                    maxii = bin_samples.shape[0]
-                    ii = np.random.randint(low=0, high=maxii)
-                    this_sample = bin_samples.iloc[ii:(ii+1)]
-                    other_samples = bin_samples[bin_samples['DATE_TIME'].dt.date == this_sample.DATE_TIME.dt.date.values[0]]
-                    n_samp = max(1, min(num_q_samples, other_samples.shape[0]))
-                    other_samples = other_samples.sample(n_samp)
-                    date = this_sample.DATE_TIME.dt.date.values[0]
-                    parent_pixel_ids = list(other_samples.parent_pixel_id)
-                    times = list(other_samples.DATE_TIME.dt.hour)
-                    if (q_ind % nqbins)==(nqbins-1): np.random.shuffle(qkeys)
-                    q_ind += 1
-                else:
-                    date = None
-                    parent_pixel_ids = []
-                    times = []
+
+                # choose a quantile bin to extract samples from
+                date, times, parent_pixel_ids, qkeys, q_ind = quantile_bin_choice(
+                    bin_dict, qkeys, q_ind, nqbins, num_q_samples, batch_type='val'
+                )
+
                                 
                 batch = datgen.get_batch(
                     var,
                     batch_size=train_pars.batch_size,
                     batch_type='val',
-                    load_binary_batch=False,
                     context_frac=context_frac,
                     p_hourly=p_hourly
                 )                
                 batch = Batch(batch, var_list=var, device=device)
                 
-                loss_dict = val_step(batch, null_stations=null_stations)
+                loss_dict = val_step(batch, var=var)
                 running_ls = update_running_loss(running_ls, loss_dict)
             
                 print_values = [(key, running_ls[key][-1]) for key in running_ls]
@@ -232,67 +240,3 @@ def fit(model, optimizer, loglikelihood, var, datgen,
         print("Done epoch %d" % (epoch+1))
     return model, losses, val_losses
 
-
-def check_parts():
-    null_stations = False
-    context_frac = 0.75 # fix constant for more stable validation?
-    if np.random.uniform() < null_batch_prob:                
-        null_stations = True
-        context_frac = 0
-    
-    # choose a quantile bin tp extract samples from
-    vv, nb = bin_dict[qkeys[q_ind % nqbins]]
-    bin_samples = read_qbin(vv, nb, batch_type='val')
-    maxii = bin_samples.shape[0]
-    ii = np.random.randint(low=0, high=maxii)
-    this_sample = bin_samples.iloc[ii]
-    #other_samples = bin_samples.iloc[max(ii-5,0):min(maxii, ii+5)]
-    #other_samples = other_samples[(other_samples.DATE_TIME - this_sample.DATE_TIME)==zero_timedelta]
-    date = this_sample.DATE_TIME.date()
-    parent_pixel_ids = [this_sample.parent_pixel_id]
-    times = [this_sample.DATE_TIME.hour]
-    if (q_ind % nqbins)==(nqbins-1): np.random.shuffle(qkeys)
-    q_ind += 1
-                    
-    batch = datgen.get_batch(
-        var,
-        batch_size=train_pars.batch_size,
-        batch_type='val',
-        load_binary_batch=False,
-        context_frac=context_frac,
-        p_hourly=p_hourly
-    )                        
-    
-    print("Coarse inputs nan/inf checks")
-    print(torch.any(torch.isnan(batch['coarse_inputs'])))
-    print(torch.any(torch.isneginf(batch['coarse_inputs'])))
-    print(torch.any(torch.isinf(batch['coarse_inputs'])))
-    print(torch.min(batch['coarse_inputs']))
-    print(torch.max(batch['coarse_inputs']))
-
-    
-    print("Fine inputs nan/inf checks")
-    print(torch.any(torch.isnan(batch['fine_inputs'])))
-    print(torch.any(torch.isneginf(batch['fine_inputs'])))
-    print(torch.any(torch.isinf(batch['fine_inputs'])))
-    print(torch.min(batch['fine_inputs']))
-    print(torch.max(batch['fine_inputs']))
-
-    batch = Batch(batch, var_list=var, device=device)
-
-    # run data through model
-    pred = model(batch.coarse_inputs, batch.fine_inputs,
-                  batch.context_data, batch.context_locs)
-            
-    print("Prediction nan/inf checks")
-    print(torch.any(torch.isnan(pred)))
-    print(torch.any(torch.isneginf(pred)))
-    print(torch.any(torch.isinf(pred)))
-    print(torch.min(pred))
-    print(torch.max(pred))
-    
-    # calculate log likelihood, trimming edge pixels at coarse scale
-    loss_dict = loglikelihood(pred, batch, null_stations=null_stations)        
-
-    print("Loss nan checks")
-    print(loss_dict)

@@ -104,9 +104,6 @@ if __name__=="__main__":
     curr_date = curr_date + datetime.timedelta(days=day)
     thisday = curr_date.day
     thismonth = curr_date.month
-    
-    #param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_paramsweep.csv'
-    param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_zoomin_paramsweep.csv'
         
     if curr_date.year == year: # we are still within the same year    
         
@@ -205,20 +202,26 @@ if __name__=="__main__":
         in large steps to begin with
         '''        
         attn_eps = 1e-6 # 1e-6
-        poly_exp = 4.
-        diminish_model = "gaussian" # ["gaussian", "polynomial"]
+        poly_exp = 6.
+        diminish_model = "polynomial" # ["gaussian", "polynomial"]
         pass_exp = 1. # 1.        
         soft_masks = True
         pixel_pass_masks = True
         binary_masks = False
         results = pd.DataFrame()
+        
+        #param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_paramsweep.csv'
+        #param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_zoomin_paramsweep.csv'
+        param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_{diminish_model}_paramsweep.csv'
+        
         #for dist_lim in [1, 10, 50, 100, 200, 400, 800]:
-        for dist_lim in list(range(10,210,10)):
+        #for dist_lim in list(range(10,210,10)):
+        for dist_lim in list(range(20,220,20)):
             
             dist_lim_far = dist_lim + 50
             
-            #for dist_pixpass in [1, 10, 50, 100, 200, 400, 800]:
-            for dist_pixpass in [100]:
+            for dist_pixpass in [1, 10, 25, 50, 75, 100]:
+            #for dist_pixpass in [100]:
                     
                 ii = 0
                 pred = []

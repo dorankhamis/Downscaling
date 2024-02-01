@@ -69,9 +69,16 @@ class SimpleDownscaler(nn.Module):
                                     kernel_size=1, stride=1, padding=0)
         self.act = nn.GELU()
 
-        self.gen_output = nn.Conv2d(ds_cross_attn[self.nups+1]//2, 1,
+        self.gen_output = nn.Conv2d(ds_cross_attn[self.nups+1]//2, output_channels,
                                     kernel_size=1, stride=1, padding=0)  
-        
+
+    # coarse_inputs=batch.coarse_inputs
+    # fine_inputs=batch.fine_inputs
+    # context_data=batch.context_data
+    # context_locs=batch.context_locs            
+    # context_masks=masks['context_masks']
+    # context_soft_masks=masks['context_soft_masks']
+    # pixel_passer=masks['pixel_passers']
     def forward(self, coarse_inputs, fine_inputs,
                 context_data, context_locs,
                 context_masks=[None, None, None, None, None],

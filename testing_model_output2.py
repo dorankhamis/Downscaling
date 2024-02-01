@@ -21,23 +21,12 @@ from plotting import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-'''
-Notes
-
-shade array: should we calculate for non-land pixels too? always setting 
-to 1 is creating artefacts at dawn/dusk/night
-
-check strange SWIN hot-spots when rest of map is zero: auxiliary input field casue?
-
-check why context points are not affecting pred in run_UK_day_tests!!
-'''
-
 ## create data generator
 datgen = data_generator()
 
 # file paths
-#var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']
-var = 'TA'
+#var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
+var = 'PRECIP'
 log_dir = './logs/'
 model_name = f'dwnsamp_{var}'
 model_outdir = f'{log_dir}/{model_name}/'
@@ -51,9 +40,7 @@ specify_chkpnt = f'{model_name}/checkpoint.pth'
 reset_chkpnt = False
 
 ## dummy batch for model param fetching
-batch = datgen.get_batch(var, batch_size=train_pars.batch_size,
-                         batch_type='train',
-                         load_binary_batch=False)
+batch = datgen.get_batch(var, batch_size=train_pars.batch_size, batch_type='train')
 
 ## create model              
 model = SimpleDownscaler(
@@ -78,10 +65,11 @@ model.to(device)
 loglikelihood = make_loss_func(train_pars)
 
 ## load checkpoint
-model, opt, chk = setup_checkpoint(model, None, device, load_prev_chkpnt,
-                                    model_outdir, log_dir,
-                                    specify_chkpnt=specify_chkpnt,
-                                    reset_chkpnt=reset_chkpnt)
+model, opt, chk = setup_checkpoint(model, None, device,
+                                   load_prev_chkpnt,
+                                   model_outdir, log_dir,
+                                   specify_chkpnt=specify_chkpnt,
+                                   reset_chkpnt=reset_chkpnt)
 plt.plot(chk['losses'])
 plt.plot(chk['val_losses'])
 plt.show()
@@ -91,24 +79,26 @@ model.eval()
 
 ###################################
 ## UK plots for all vars
-var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']
+var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
 log_dir = './logs/'
 load_prev_chkpnt = True
 reset_chkpnt = False
+PLOT = True
 output_dir = '/home/users/doran/projects/downscaling/output/test_plots/'
 Path(output_dir).mkdir(parents=True, exist_ok=True)
 for var in var_names:
     model_name = f'dwnsamp_{var}'
     model_outdir = f'{log_dir}/{model_name}/'
     Path(model_outdir).mkdir(parents=True, exist_ok=True)
+    
+    if var=='PRECIP': datgen.load_EA_rain_gauge_data()
 
     #specify_chkpnt = None # f'{model_name}/checkpoint.pth' 
     specify_chkpnt = f'{model_name}/checkpoint.pth'
 
     ## dummy batch for model param fetching
     batch = datgen.get_batch(var, batch_size=train_pars.batch_size,
-                             batch_type='train',
-                             load_binary_batch=False)
+                             batch_type='train')
                                   
     ## create model              
     model = SimpleDownscaler(
@@ -135,16 +125,15 @@ for var in var_names:
                                         reset_chkpnt=reset_chkpnt)
 
     model.eval()
-         
+
 
     # get tile(s) of whole UK
-    date_string = "20160301"
-    it = 10
+    date_string = "20140101"
+    it = 9
     tile = False
     context_frac = 0.7
-    constraints = True
+    constraints = False
     batch = datgen.get_all_space(var, batch_type='train',
-                                 load_binary_batch=False,
                                  context_frac=context_frac,
                                  date_string=date_string, it=it,
                                  timestep='hourly',
@@ -154,48 +143,19 @@ for var in var_names:
     iys = batch['iys']
 
     batch = Batch(batch, var_list=var, device=device, constraints=constraints)
+    masks = create_attention_masks(model, batch, var,
+                                   dist_lim = None,
+                                   dist_lim_far = None,
+                                   attn_eps = None,
+                                   poly_exp = None,
+                                   diminish_model = None,
+                                   dist_pixpass = None,
+                                   pass_exp = None)
+    
     station_targets = batch.raw_station_dict
     sample_metadata = batch.batch_metadata
     met_vars = datgen.coarse_variable_order
     fine_vars = datgen.fine_variable_order
-      
-    # bits for grid point attention
-    # probably want to do a parameter optimization for the dist_lims / attn_eps, dist_pixpass / pass_exp!
-    dist_lim = 100 # 100
-    dist_lim_far = 150 # 150
-    attn_eps = 1e-6 # 1e-6
-    poly_exp = 4.
-    diminish_model = "gaussian" #["gaussian", "polynomial"]
-    pass_exp = 1. # 1.
-    dist_pixpass = 120 # 100
-    soft_masks = True
-    pixel_pass_masks = True
-    binary_masks = False
-    b = 0
-    distances, softmask, scale_factors, site_yx = prepare_attn(
-        model,
-        batch,
-        datgen.site_metadata,
-        datgen.fine_grid,
-        b=b,
-        dist_lim=dist_lim,
-        dist_lim_far=dist_lim_far,
-        attn_eps=attn_eps,
-        poly_exp=poly_exp,
-        diminish_model=diminish_model
-    )
-    masks = {
-        'context_soft_masks':[None,None,None,None],
-        'pixel_passers':[None,None,None,None],
-        'context_masks':[None,None,None,None]
-    }
-    if soft_masks:
-        masks['context_soft_masks'] = build_soft_masks(softmask, scale_factors, device)
-    if pixel_pass_masks:        
-        masks['pixel_passers'] = build_pixel_passers(distances, scale_factors, dist_pixpass, pass_exp, device)
-        # reshaping is done in the model...
-    if binary_masks:
-        masks['context_masks'] = build_binary_masks(distances, scale_factors, dist_lim_far, device)
     
     with torch.no_grad():
         pred = model(batch.coarse_inputs, batch.fine_inputs,
@@ -204,12 +164,64 @@ for var in var_names:
                      context_soft_masks=masks['context_soft_masks'],
                      pixel_passer=masks['pixel_passers'])
         pred = pred.cpu().numpy()
+    if (var=='SWIN') or (var=='PRECIP'): pred = pred.clip(min=0)
 
-    if var=='SWIN': pred = pred.clip(min=0)
+    #np.save(output_dir + f'coarse_inputs_{var}_{date_string}_{it}.npy', batch.coarse_inputs.cpu().numpy())
+    #np.save(output_dir + f'prediction_{var}_{date_string}_{it}.npy', pred)
 
-    b = 0    
-    plot_batch_tiles(batch, pred, fine_vars, met_vars, b=b,
-                     sea_mask=None, trim_edges=False, constraints=constraints)
+    if PLOT:
+        era5 = batch.coarse_inputs.cpu().numpy()
+        if var=='WS':
+            #era5_ws_unnorm = unnormalise_img(datgen.parent_pixels['hourly'].isel(time=it).ws.values, 'WS')
+            era5_unnorm = unnormalise_img(era5, 'UX')
+            pred_unnorm = unnormalise_img(pred, 'UX')            
+        else:
+            era5_unnorm = unnormalise_img(era5, var)
+            pred_unnorm = unnormalise_img(pred, var)
+
+        cmap = cm.get_cmap('plasma')
+        norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
+        im = cm.ScalarMappable(cmap=cmap, norm=norm)
+        if var=='WS':
+            fig, ax = plt.subplots(2,2)
+            ax[0,0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[0,1].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[1,0].imshow(era5_unnorm[0,1,::-1,:], cmap=cmap, norm=norm)
+            ax[1,1].imshow(pred_unnorm[0,1,::-1,:], cmap=cmap, norm=norm)
+            ax[0,0].set_title(f'ERA5 UX')
+            ax[0,1].set_title(f'Downscaled UX')
+            ax[1,0].set_title(f'ERA5 VY')
+            ax[1,1].set_title(f'Downscaled VY')
+        else:
+            fig, ax = plt.subplots(1,2)
+            ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[1].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[0].set_title(f'ERA5 {var}')
+            ax[1].set_title(f'Downscaled {var}')
+        fig.colorbar(im, ax=ax.ravel().tolist())
+        plt.show()
+        
+        
+        # constraint_unnorm = unnormalise_img(batch.constraint_targets.detach().numpy(), var)
+
+        # fig, ax = plt.subplots(1,3)
+        # cmap = cm.get_cmap('plasma')
+        # norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
+        # im = cm.ScalarMappable(cmap=cmap, norm=norm)
+        # ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        # ax[1].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        # ax[2].imshow(constraint_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        # ax[0].set_title(f'ERA5 {var}')
+        # ax[1].set_title(f'Downscaled {var}')
+        # ax[2].set_title(f'Hi-res constraint {var}')
+        # fig.colorbar(im, ax=ax.ravel().tolist())
+        # plt.show()
+
+
+    if PLOT:
+        b = 0
+        plot_batch_tiles(batch, pred, fine_vars, met_vars, b=b,
+                         sea_mask=None, trim_edges=False, constraints=constraints)
 
     # run again but zero all the context inputs to see what happens without them
     batch2 = create_null_batch(batch)
@@ -218,30 +230,89 @@ for var in var_names:
                       batch2.context_data, batch2.context_locs)
         pred2 = pred2.cpu().numpy()
     if var=='SWIN': pred2 = pred2.clip(min=0)
-        
-    ## look at tiles and station values
-    b = 0    
-    plot_batch_tiles(batch, pred2, fine_vars, met_vars, b=b,
-                     sea_mask=None, trim_edges=False, constraints=False)
-        
-    site_res = plot_context_and_target_preds(
-        [pred, pred2], b,
-        batch, station_targets, var, 
-        model_names=['this_model', 'this_model_nc']
-    )
-    
-    calc_metrics(site_res['target'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model_nc')
-    calc_metrics(site_res['target'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model')
-    
-    calc_metrics(site_res['context'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model_nc')
-    calc_metrics(site_res['context'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model')
-    
-        
-    plot_station_locations(batch.raw_station_dict, batch.fine_inputs, b)
 
-    np.save(output_dir + f'coarse_inputs_{var}_{date_string}_{it}.npy', batch.coarse_inputs.cpu().numpy())
-    np.save(output_dir + f'prediction_{var}_{date_string}_{it}.npy', pred)
+    if PLOT:
+        era5 = batch.coarse_inputs.cpu().numpy()
+        era5_unnorm = unnormalise_img(era5, var)
+        pred_unnorm = unnormalise_img(pred, var)
+        pred2_unnorm = unnormalise_img(pred2, var)
 
+        fig, ax = plt.subplots(1,3)
+        cmap = cm.get_cmap('plasma')
+        norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
+        im = cm.ScalarMappable(cmap=cmap, norm=norm)
+        ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        ax[1].imshow(pred2_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        ax[2].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        ax[0].set_title(f'ERA5 {var}')
+        ax[1].set_title(f'Downscaled_nc {var}')
+        ax[2].set_title(f'Downscaled {var}')
+        fig.colorbar(im, ax=ax.ravel().tolist())
+        plt.show()
+
+        b = 0
+        plot_batch_tiles(batch, pred2, fine_vars, met_vars, b=b,
+                         sea_mask=None, trim_edges=False, constraints=False)
+
+    ## look at station values
+    if PLOT:
+        b = 0          
+        site_res = plot_context_and_target_preds(
+            [pred, pred2], b,
+            batch, station_targets, var, 
+            model_names=['this_model', 'this_model_nc']
+        )
+        
+        (calc_metrics(site_res['target']
+            .pivot(columns='variable', index='SITE_ID', values='value'),
+             var, 'this_model_nc')
+         )
+        (calc_metrics(site_res['target']
+            .pivot(columns='variable', index='SITE_ID', values='value'),
+             var, 'this_model')
+         )
+        
+        calc_metrics(site_res['context'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model_nc')
+        calc_metrics(site_res['context'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model')
+
+        plot_station_locations(batch.raw_station_dict, batch.fine_inputs, b,
+                               plot_target=False, labels=False)
+
+
+# diminish_mask = distances > model_pars.dist_lim
+# softmask = np.ones(distances.shape, dtype=np.float32)
+# softmask2 = np.ones(distances.shape, dtype=np.float32)
+# #if diminish_model=="gaussian":
+# attn_sigmasq = -(model_pars.dist_lim_far - model_pars.dist_lim)**2 / np.log(model_pars.attn_eps)
+# softmask[diminish_mask] = np.exp(- (distances[diminish_mask] - model_pars.dist_lim)**2 / attn_sigmasq)
+# #elif diminish_model=="polynomial":
+# softmask2[diminish_mask] = 1. / (distances[diminish_mask] / model_pars.dist_lim)**6#model_pars.poly_exp
+# plt.scatter(softmask[0,1,:,:].flatten(), softmask2[0,1,:,:].flatten())
+# plt.show()
+
+
+
+## loading and visualising
+var = 'RH'
+era5 = np.load(f'./output/test_plots/coarse_inputs_{var}_20170101_10.npy')
+pred = np.load(f'./output/test_plots/prediction_{var}_20170101_10.npy')
+
+era5 = unnormalise_img(era5, var)
+pred = unnormalise_img(pred, var)
+
+#if var=='SWIN' or var=='LWIN' or var=='WS':
+#   pred = pred.clip(min=0)
+
+fig, ax = plt.subplots(1,2)
+cmap = cm.get_cmap('plasma')
+norm = Normalize(np.min(pred), np.max(pred))
+im = cm.ScalarMappable(cmap=cmap, norm=norm)
+ax[0].imshow(era5[0,0,::-1,:], cmap=cmap, norm=norm)
+ax[1].imshow(pred[0,0,::-1,:], cmap=cmap, norm=norm)
+ax[0].set_title(f'ERA5 {var}')
+ax[1].set_title(f'Downscaled {var}')
+fig.colorbar(im, ax=ax.ravel().tolist())
+plt.show()
 
 # compare against simply interpolated ERA5 at site pixels?
 pred_era5 = interp_to_grid(datgen.parent_pixels['hourly'][datgen.var_name_map.loc[var].coarse][it,:,:], datgen.fine_grid, coords=['lat', 'lon'])
@@ -291,7 +362,6 @@ p_hourly = 1
 context_frac = 0.7
 batch = datgen.get_batch(var, batch_size=train_pars.batch_size,
                        batch_type='train',
-                       load_binary_batch=False,
                        context_frac=context_frac,
                        p_hourly=p_hourly)
                            
@@ -558,7 +628,6 @@ it = 5
 tile = False
 context_frac = 0.7
 batch = datgen.get_all_space(var, batch_type='train',
-                             load_binary_batch=False,
                              context_frac=context_frac,
                              date_string=date_string, it=it,
                              timestep='hourly',
@@ -722,7 +791,6 @@ it = list(np.arange(24))
 tile = False
 min_overlap = 3
 batch = datgen.get_all_space(var, batch_type='train',
-                             load_binary_batch=True,
                              context_frac=context_frac,                             
                              date_string=date_string, it=it,
                              timestep='hourly',
@@ -852,27 +920,7 @@ plt.show()
 # ax[2,1].imshow(batch.fine_inputs[0,8,:,:].cpu().numpy()[::-1,:])
 # plt.show()
 
-## loading and visualising
-var = 'SWIN'
-era5 = np.load(f'./output/test_plots/coarse_inputs_{var}_20170101_10.npy')
-pred = np.load(f'./output/test_plots/prediction_{var}_20170101_10.npy')
 
-era5 = unnormalise_img(era5, var)
-pred = unnormalise_img(pred, var)
-
-if var=='SWIN' or var=='LWIN' or var=='WS':
-    pred = pred.clip(min=0)
-
-fig, ax = plt.subplots(1,2)
-cmap = cm.get_cmap('plasma')
-norm = Normalize(np.min(pred), np.max(pred))
-im = cm.ScalarMappable(cmap=cmap, norm=norm)
-ax[0].imshow(era5[0,0,::-1,:], cmap=cmap, norm=norm)
-ax[1].imshow(pred[0,0,::-1,:], cmap=cmap, norm=norm)
-ax[0].set_title(f'ERA5 {var}')
-ax[1].set_title(f'Downscaled {var}')
-fig.colorbar(im, ax=ax.ravel().tolist())
-plt.show()
 
            
 '''

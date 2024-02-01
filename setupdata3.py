@@ -15,25 +15,26 @@ from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
 from scipy.ndimage import gaussian_filter
 
-from timeout import Timeout
-from data_classes.met_data import ERA5Data
-from data_classes.cosmos_data import CosmosMetaData, CosmosData
-from utils import *
-from params import normalisation as nm
-from params import data_pars as dp
-from solar_position import SolarPosition
+from downscaling.timeout import Timeout
+from downscaling.data_classes.met_data import ERA5Data
+from downscaling.data_classes.cosmos_data import CosmosMetaData, CosmosData
+from downscaling.utils import *
+from downscaling.params import normalisation as nm
+from downscaling.params import data_pars as dp
+from downscaling.solar_position import SolarPosition
 
 EPS = 1e-10
 
 hj_base = '/gws/nopw/j04/hydro_jules/data/uk/'
 hj_ancil_fldr = hj_base + '/ancillaries/'
-#era5_fldr = hj_base + '/driving_data/era5/bn_grid/'
 era5_fldr = hj_base + '/driving_data/era5/28km_grid/'
 nz_base = '/gws/nopw/j04/ceh_generic/netzero/'
 nz_train_path = nz_base + '/downscaling/training_data/'
-precip_fldr = '/badc/ukmo-hadobs/data/insitu/MOHC/HadOBS/HadUK-Grid/v1.1.0.0/1km/rainfall/day/latest/'
+#precip_fldr = '/badc/ukmo-hadobs/data/insitu/MOHC/HadOBS/HadUK-Grid/v1.1.0.0/1km/rainfall/day/latest/'
+precip_fldr = '/gws/nopw/j04/ceh_generic/netzero/downscaling/ceh-gear/'
 home_data_dir = '/home/users/doran/data_dump/'
 midas_fldr = home_data_dir + '/MetOffice/midas_data/'
+ea_fldr = home_data_dir + '/EA_rain_gauges/'
 chessmet_dir = hj_base + '/driving_data/chess/chess-met/daily/'
 
 def load_process_chess(year, month, day, chess_var, normalise=True):
@@ -120,6 +121,44 @@ def read_one_cosmos_site_met(SID, missing_val = -9999.0):
     data.preprocess_all(missing_val, 'DATE_TIME')
     return data
 
+def circular_mean(x):
+    ''' calculate wind components
+    Wind direction is generally reported by the direction from which the wind originates. For example, a north or northerly wind blows from the north to the south
+    Wind direction increases clockwise such that:
+        - a northerly wind is 0°, an easterly wind is 90°,
+        - a southerly wind is 180°, and
+        - a westerly wind is 270°.
+    It is still easy to compute the wind components, u and v,
+    given the meteorological wind angle. Let Φ be the meteorological
+    wind direction angle, then the following equations can be applied:
+
+    u = - W sin Φ   # wind speed blowing east
+    v = - W cos Φ   # wind speed blowing north
+    W = sqrt(u^2 + v^2)
+    '''
+    return np.arctan2(np.sum(np.sin(np.deg2rad(x))),
+                      np.sum(np.cos(np.deg2rad(x))))
+
+def get_50m_DTM_elev(site_meta):
+    from convertbng.util import convert_bng
+    import rasterio
+    eastings, northings = convert_bng(site_meta.LONGITUDE, site_meta.LATITUDE)
+    ii = np.where(site_meta.SITE_ID == '01386_scilly-st-marys-airport')[0][0]
+    eastings[ii] = 91712
+    northings[ii] = 10496
+    
+    coords = np.column_stack([eastings, northings])
+    path_to_dtm = '/home/users/doran/data_dump/DTM/DTMGEN_UK.tif'
+    with rasterio.open(path_to_dtm) as src:
+        data_at_points = np.array([p[0] for p in src.sample(coords)])
+    non_cosmos_inds = np.where(site_meta.SITE_ID.str.contains('EA_'))[0]
+    site_meta['ALTITUDE'].iloc[non_cosmos_inds] = data_at_points[non_cosmos_inds]
+    (site_meta[site_meta['SITE_ID'].str.contains('EA_')]
+        [['SITE_ID', 'LONGITUDE', 'LATITUDE', 'ALTITUDE']]
+        .to_csv(ea_fldr + '/site_elevation.csv')
+    )
+    return site_meta
+
 def provide_cosmos_met_data(metadata, met_vars, sites=None, missing_val = -9999.0, forcenew=False):
     Path(home_data_dir+'/met_pickles/').mkdir(exist_ok=True, parents=True)
     fname = home_data_dir+'/met_pickles/cosmos_site_met.pkl'
@@ -130,16 +169,32 @@ def provide_cosmos_met_data(metadata, met_vars, sites=None, missing_val = -9999.
     else:        
         met_data = {}
         if sites is None: sites = metadata.site['SITE_ID']
+        # remove wind components and insert wind direction
+        new_met_vars = np.hstack([np.setdiff1d(met_vars, ['UX', 'VY']), ['WD']])
         for SID in sites:            
-            data = read_one_cosmos_site_met(SID, missing_val = -9999.0)    
-            data = data.subhourly[met_vars]
+            data = read_one_cosmos_site_met(SID, missing_val = missing_val)    
+            data = data.subhourly[new_met_vars]
             # check that this aggregation labelling matches ERA5 hourly meaning!
-            met_data[SID] = data.resample('1H', origin='end_day').mean()
+            thisdat = pd.merge(
+                pd.merge(
+                    (data.loc[:,np.setdiff1d(new_met_vars, ['PRECIP', 'WD'])]
+                        .resample('1H', label='right', closed='right').mean()
+                    ),
+                    (data.loc[:,['PRECIP']]
+                        .resample('1H', label='right', closed='right').sum()
+                    ), on='DATE_TIME', how='left'
+                ), (data.loc[:,['WD']].reset_index()
+                        .resample('1H', label='right', closed='right', on='DATE_TIME').apply(circular_mean)
+                    ), on='DATE_TIME', how='left'
+            )
+            thisdat['UX'] = - thisdat.WS * np.sin(thisdat.WD)
+            thisdat['VY'] = - thisdat.WS * np.cos(thisdat.WD)
+            met_data[SID] = thisdat
         metdat = dict(data=met_data)
         with open(fname, 'wb') as fs:
             pickle.dump(metdat, fs)
     return met_data
-    
+
 def provide_midas_met_data(metadata, met_vars, sites=None, forcenew=False):
     Path(home_data_dir+'/met_pickles/').mkdir(exist_ok=True, parents=True)
     fname = home_data_dir+'/met_pickles/midas_site_met.pkl'
@@ -150,12 +205,16 @@ def provide_midas_met_data(metadata, met_vars, sites=None, forcenew=False):
     else:        
         met_data = {}
         if sites is None: sites = metadata['SITE_ID']
+        # remove wind components and insert wind direction
+        new_met_vars = np.hstack([np.setdiff1d(met_vars, ['UX', 'VY']), ['WD']])
         for SID in sites:
-            if Path(midas_fldr+SID+'.pkl').exists():
-                with open(midas_fldr+SID+'.pkl', 'rb') as fo:
-                    data = pickle.load(fo)
+            if Path(midas_fldr + f'/{SID}.parquet').exists():
+                data = pd.read_parquet(midas_fldr + f'/{SID}.parquet')
                 try:
-                    met_data[SID] = data[met_vars]
+                    thisdat = data[new_met_vars]
+                    thisdat['UX'] = - thisdat.WS * np.sin(np.deg2rad(thisdat.WD))
+                    thisdat['VY'] = - thisdat.WS * np.cos(np.deg2rad(thisdat.WD))
+                    met_data[SID] = thisdat
                 except:
                     print(f'Met vars missing from {SID}')
         metdat = dict(data=met_data)
@@ -256,6 +315,18 @@ def calculate_illumination_map(sp, grid, height_grid):
     )
     return solar_illum
 
+
+# swin_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['SWIN'].coarse][it,:,:] * nm.swin_norm # de-nornmalise!
+# fine_grid = dg.fine_grid
+# sp = dg.sp
+# press_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu # de-nornmalise
+# press_fine = dg.p_1km_elev[it,:,:]
+# height_grid = dg.height_grid
+# shading_array = dg.shading_array[it,:]
+# sea_shading_array = dg.sea_shading_array[it,:]
+# scale = dg.scale
+# sky_view_factor = dg.skyview_map
+
 def partition_interp_solar_radiation(swin_coarse, fine_grid, sp,
                                      press_coarse, press_fine,
                                      height_grid, shading_array,
@@ -343,7 +414,7 @@ def partition_interp_solar_radiation(swin_coarse, fine_grid, sp,
         # renorm to match the input coarse SWIN to counteract errors in partitioning
         Sw_1km = scale_by_coarse_data(Sw_1km.copy(), swin_coarse, fine_grid, scale)        
         return Sw_1km
-    
+
 def reflect_pad_nans(data, ysize=1200, xsize=600):
     if len(data.values.shape)==2:
         nx_l = len(np.where(np.isnan(data[ysize//2, :xsize//2]))[0])
@@ -353,16 +424,24 @@ def reflect_pad_nans(data, ysize=1200, xsize=600):
         ny_t = len(np.where(np.isnan(data[ysize//2:, xsize//2]))[0])
         
         # reflect
-        data.values[ny_b:-ny_t, :nx_l] = data.values[ny_b:-ny_t, nx_l:2*nx_l][:, ::-1]
-        data.values[ny_b:-ny_t, -nx_r:] = data.values[ny_b:-ny_t, -2*nx_r:-nx_r][:, ::-1]
-        data.values[:ny_b, nx_l:-nx_r] = data.values[ny_b:2*ny_b, nx_l:-nx_r][::-1, :]
-        data.values[-ny_t:, nx_l:-nx_r] = data.values[-2*ny_t:-ny_t, nx_l:-nx_r][::-1, :]
+        if nx_l>0:
+            data.values[:, :nx_l] = data.values[:, nx_l:2*nx_l][:, ::-1] # ny_b:-ny_t
+        if nx_r>0:
+            data.values[:, -nx_r:] = data.values[:, -2*nx_r:-nx_r][:, ::-1] # ny_b:-ny_t
+        if ny_b>0:
+            data.values[:ny_b, :] = data.values[ny_b:2*ny_b, :][::-1, :] # nx_l:-nx_r
+        if ny_t>0:
+            data.values[-ny_t:, :] = data.values[-2*ny_t:-ny_t, :][::-1, :] # nx_l:-nx_r
         
         # corners
-        data.values[:ny_b, :nx_l] = np.nanmean(data.values[:2*ny_b, :2*nx_l])
-        data.values[-ny_t:, :nx_l] = np.nanmean(data.values[-2*ny_t:, :2*nx_l])
-        data.values[:ny_b:, -nx_r:] = np.nanmean(data.values[:2*ny_b:, -2*nx_r:])
-        data.values[-ny_t:, -nx_r:] = np.nanmean(data.values[-2*ny_t:, -2*nx_r:])
+        if ny_b>0 and nx_l>0:
+            data.values[:ny_b, :nx_l] = np.nanmean(data.values[:2*ny_b, :2*nx_l])
+        if ny_t>0 and nx_l>0:
+            data.values[-ny_t:, :nx_l] = np.nanmean(data.values[-2*ny_t:, :2*nx_l])
+        if ny_b>0 and nx_r>0:
+            data.values[:ny_b:, -nx_r:] = np.nanmean(data.values[:2*ny_b:, -2*nx_r:])
+        if ny_t>0 and nx_r>0:
+            data.values[-ny_t:, -nx_r:] = np.nanmean(data.values[-2*ny_t:, -2*nx_r:])
     else:
         nx_l = len(np.where(np.isnan(data[0, ysize//2, :xsize//2]))[0])
         nx_r = len(np.where(np.isnan(data[0, ysize//2, xsize//2:]))[0])
@@ -371,25 +450,31 @@ def reflect_pad_nans(data, ysize=1200, xsize=600):
         ny_t = len(np.where(np.isnan(data[0, ysize//2:, xsize//2]))[0])
         
         # reflect
-        data.values[:, ny_b:-ny_t, :nx_l] = data.values[:, ny_b:-ny_t, nx_l:2*nx_l][:, :, ::-1]
-        data.values[:, ny_b:-ny_t, -nx_r:] = data.values[:, ny_b:-ny_t, -2*nx_r:-nx_r][:, :, ::-1]
-        data.values[:, :ny_b, nx_l:-nx_r] = data.values[:, ny_b:2*ny_b, nx_l:-nx_r][:, ::-1, :]
-        data.values[:, -ny_t:, nx_l:-nx_r] = data.values[:, -2*ny_t:-ny_t, nx_l:-nx_r][:, ::-1, :]
+        data.values[:, :, :nx_l] = data.values[:, :, nx_l:2*nx_l][:, :, ::-1]
+        data.values[:, :, -nx_r:] = data.values[:, :, -2*nx_r:-nx_r][:, :, ::-1]
+        data.values[:, :ny_b, :] = data.values[:, ny_b:2*ny_b, :][:, ::-1, :]
+        data.values[:, -ny_t:, :] = data.values[:, -2*ny_t:-ny_t, :][:, ::-1, :]
         
         # corners
-        data.values[:, :ny_b, :nx_l] = (np.nanmean(data.values[:, :2*ny_b, :2*nx_l], axis=(1,2))[...,None, None] + 
-            np.zeros((data.values.shape[0], ny_b, nx_l)))
-        data.values[:, -ny_t:, :nx_l] = (np.nanmean(data.values[:, -2*ny_t:, :2*nx_l], axis=(1,2))[...,None, None] + 
-            np.zeros((data.values.shape[0], ny_t, nx_l)))
-        data.values[:, :ny_b:, -nx_r:] = (np.nanmean(data.values[:, :2*ny_b:, -2*nx_r:], axis=(1,2))[...,None, None] + 
-            np.zeros((data.values.shape[0], ny_b, nx_r)))
-        data.values[:, -ny_t:, -nx_r:] = (np.nanmean(data.values[:, -2*ny_t:, -2*nx_r:], axis=(1,2))[...,None, None] + 
-            np.zeros((data.values.shape[0], ny_t, nx_r)))    
+        if ny_b>0 and nx_l>0:
+            data.values[:, :ny_b, :nx_l] = (np.nanmean(data.values[:, :2*ny_b, :2*nx_l], axis=(1,2))[...,None, None] + 
+                np.zeros((data.values.shape[0], ny_b, nx_l)))
+        if ny_t>0 and nx_l>0:
+            data.values[:, -ny_t:, :nx_l] = (np.nanmean(data.values[:, -2*ny_t:, :2*nx_l], axis=(1,2))[...,None, None] + 
+                np.zeros((data.values.shape[0], ny_t, nx_l)))
+        if ny_b>0 and nx_r>0:
+            data.values[:, :ny_b:, -nx_r:] = (np.nanmean(data.values[:, :2*ny_b:, -2*nx_r:], axis=(1,2))[...,None, None] + 
+                np.zeros((data.values.shape[0], ny_b, nx_r)))
+        if ny_t>0 and nx_r>0:
+            data.values[:, -ny_t:, -nx_r:] = (np.nanmean(data.values[:, -2*ny_t:, -2*nx_r:], axis=(1,2))[...,None, None] + 
+                np.zeros((data.values.shape[0], ny_t, nx_r)))
     return data
     
 class Batch:
     def __init__(self, batch, masks=None, constraints=True,
                  var_list=None, device=None):
+        if type(var_list)==str:
+            var_list = [var_list]
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         try:
@@ -398,23 +483,35 @@ class Batch:
             
             self.coarse_inputs = batch['coarse_inputs'].to(device)
             self.fine_inputs = batch['fine_inputs'].to(device)
-            self.context_station_dict = tensorise_station_targets(
-                [s['context'] for s in batch['station_targets']],
-                device=device,
-                var_list=var_list
-            )
-            self.target_station_dict = tensorise_station_targets(
-                [s['target'] for s in batch['station_targets']],
-                device=device,
-                var_list=var_list
-            )
+            
+            if var_list[0]=='WS':
+                self.context_station_dict = tensorise_station_targets(
+                    [s['context'] for s in batch['station_targets']],
+                    device=device,
+                    var_list=['UX', 'VY']
+                )
+                self.target_station_dict = tensorise_station_targets(
+                    [s['target'] for s in batch['station_targets']],
+                    device=device,
+                    var_list=['UX', 'VY']
+                )
+            else:
+                self.context_station_dict = tensorise_station_targets(
+                    [s['context'] for s in batch['station_targets']],
+                    device=device,
+                    var_list=var_list
+                )
+                self.target_station_dict = tensorise_station_targets(
+                    [s['target'] for s in batch['station_targets']],
+                    device=device,
+                    var_list=var_list
+                )
+            
             if constraints:
                 self.constraint_targets = batch['constraints'].to(device)
             else:
                 self.constraint_targets = None
-            
-            #self.context_data = batch['station_data'].to(device)
-            #self.context_locs = batch['context_locations'].to(device)
+
             self.context_data = [a.to(device) for a in batch['station_data']]
             self.context_locs = [a.to(device) for a in batch['context_locations']]
             
@@ -424,15 +521,8 @@ class Batch:
             self.target_num_obs = [s['target'].values.astype(np.int32).flatten()
                 for s in batch['station_num_obs']]
             
-            n_gridpts = batch['fine_inputs'].shape[-1] * batch['fine_inputs'].shape[-2]
-            #n_cntxpts = batch['context_locations'].shape[-1]
-            n_batch = batch['coarse_inputs'].shape[0]
-                       
-            # self.context_mask = make_context_mask(n_gridpts, n_cntxpts,
-                                                  # batch['context_padding']).to(device)
-            #self.context_mask = [make_context_mask2(n_gridpts, batch['context_locations'][b].shape[-1]).to(device) for b in range(n_batch)]
-            #self.masks = [m.type(torch.bool).to(device) for m in masks]        
-            
+            self.n_gridpts = batch['fine_inputs'].shape[-1] * batch['fine_inputs'].shape[-2]
+            self.n_batch = batch['coarse_inputs'].shape[0]
         except:
             print('Creating empty batch')
             self.raw_station_dict = None
@@ -442,10 +532,8 @@ class Batch:
             self.context_station_dict = None
             self.target_station_dict = None
             self.constraint_targets = None
-            #self.masks = None
             self.context_data = None
             self.context_locs = None
-            #self.context_mask = None            
             self.context_num_obs = None
             self.target_num_obs = None
     
@@ -460,16 +548,15 @@ class Batch:
             self.constraint_targets = other_batch.constraint_targets.clone()
         except:
             self.constraint_targets = None
-        #self.masks = [m.clone() for m in other_batch.masks]
         self.context_data = [m.clone() for m in other_batch.context_data]
         self.context_locs = [m.clone() for m in other_batch.context_locs]
-        #self.context_mask = [m.clone() for m in other_batch.context_mask]        
         self.context_num_obs = [m.copy() for m in other_batch.context_num_obs]
         self.target_num_obs = [m.copy() for m in other_batch.target_num_obs]
-        
+
+
 
 class data_generator():
-    def __init__(self, train_sites=None, heldout_sites=None, load_site_data=True):
+    def __init__(self, train_sites=None, heldout_sites=None, load_site_data=True, precip_sites=False):
         
         # load 1km bng grid        
         #self.chess_grid = xr.open_dataset(hj_ancil_fldr+'/chess_lat_lon.nc')
@@ -484,18 +571,44 @@ class data_generator():
         self.dim_l = dp.dim_l # size of lo-res image in 28km pixels (size of subest of UK to train on each sample)
         self.dim_h = self.dim_l*dp.scale # size of hi-res image in 1km pixels
         
-        # load parent pixel ids on reprojected/regridded ERA5 BNG 28km cells        
-        #parent_pixels = xr.open_dataset(home_data_dir + '/chess/chess_25km_pixel_ids.nc')
+        # load parent pixel ids on reprojected/regridded ERA5 BNG 28km cells
         self.coarse_grid = xr.open_dataset(home_data_dir + '/bng_grids/bng_28km_pixel_ids.nc')
         self.coarse_grid = self.coarse_grid.load()
         # fill elev nans as zeros (the sea)
         self.coarse_grid.elev.values[np.isnan(self.coarse_grid.elev.values)] = 0
         
         # load child pixels on 1km BNG grid labelled by parent pixel IDs
-        #self.child_parent_map = xr.open_dataset(home_data_dir + '/chess/chess_1km_25km_parent_pixel_ids.nc')
         self.fine_grid = xr.open_dataset(home_data_dir + '/bng_grids/bng_1km_28km_parent_pixel_ids.nc')
         self.fine_grid = self.fine_grid.load()
         
+        ## load hi res static data        
+        #self.height_grid = xr.open_dataset(hj_ancil_fldr+'/uk_ihdtm_topography+topoindex_1km.nc')
+        self.height_grid = xr.open_dataset(home_data_dir + '/height_map/topography_bng_1km.nc')
+        self.height_grid = self.height_grid.drop(['topi','stdtopi', 'fdepth','area']).load()        
+        self.elev_vars = ['elev', 'stdev', 'slope', 'aspect']
+        
+        # treat NaNs in height grid        
+        # 1: elev, sea NaNs should be elev==0        
+        self.height_grid.elev.values[np.isnan(self.height_grid.elev.values)] = 0
+        # 2: stdev, sea NaNs should be stdev==0        
+        self.height_grid.stdev.values[np.isnan(self.height_grid.stdev.values)] = 0
+        # 3: slope, sea NaNs should be slope==0
+        self.height_grid.slope.values[np.isnan(self.height_grid.slope.values)] = 0
+        # 4: aspect, sea NaNs are tricky, aspect is "straight up", stick with uniform noise
+        asp_mask = np.isnan(self.height_grid.aspect.values)
+        self.height_grid.aspect.values[asp_mask] =  np.random.uniform(
+            low=0, high=360, size=len(np.where(asp_mask)[0])
+        )
+        
+        # load land cover for wind speed / long wave radiation model
+        self.land_cover = load_landcover()
+        # invert (due to rasterio loading 'correct' way up'
+        self.land_cover = self.land_cover[:,::-1,:]
+        # and trim to size (this assumed land cover map is bigger!)
+        self.land_cover = self.land_cover[:,:len(self.fine_grid.y),:len(self.fine_grid.x)]
+        self.lcm_names = ['l_wooded', 'l_open', 'l_mountain-heath', 'l_urban']        
+        
+        # load sky view factor map
         svfs = np.load(nz_base + '/downscaling/training_data/sky_view_factor.npy')
         sea_svfs = np.load(nz_base + '/downscaling/training_data/sea_sky_view_factor.npy')
         self.skyview_map = (self.fine_grid.landfrac.copy()).astype(np.float32)
@@ -507,21 +620,31 @@ class data_generator():
     
         # define ERA5 (coarse) and COSMOS (fine) variables to load
         var_name_map = dict(
-            name   = ['Air_Temp', 'Pressure', 'Short_Wave_Rad_In', 'Long_Wave_Rad_In', 'Wind_Speed', 'Relative_Humidity'],
-            coarse = ['t2m'     , 'sp'      , 'msdwswrf'         , 'msdwlwrf'        , 'ws'        , 'rh'],
-            fine   = ['TA'      , 'PA'      , 'SWIN'             , 'LWIN'            , 'WS'        , 'RH']
+            name   = ['Air_Temp', 'Pressure', 'Short_Wave_Rad_In',
+                      'Long_Wave_Rad_In', 'Wind_Speed', 'Relative_Humidity',
+                      'Precipitation', 'Wind_Speed_X', 'Wind_Speed_Y'],
+            coarse = ['t2m', 'sp', 'msdwswrf', 'msdwlwrf', 'ws', 'rh',
+                      'mtpr', 'u10', 'v10'],
+            fine   = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH',
+                      'PRECIP', 'UX', 'VY']
         )        
         self.var_name_map = pd.DataFrame(var_name_map)
-        self.var_name_map = self.var_name_map.assign(
-            chess = np.array(['tas', 'psurf', 'rsds', 
-                              'rlds', 'sfcWind', 'huss'])
-            # huss is originally specific humidity but we transform it to RH
-        )
+        # self.var_name_map = self.var_name_map.assign(
+            # chess = np.array(['tas', 'psurf', 'rsds', 'rlds',
+                              # 'sfcWind', 'huss', 'precip'])
+            # # huss is originally specific humidity but we transform it to RH
+        # )
         self.var_name_map.index = self.var_name_map.fine
+        
+        # define model inputs for each variable
+        self.fine_variable_order = []
+        self.coarse_variable_order = []
+        self.context_variable_order = []
 
         self.rh_extra_met_vars = ['TA', 'PA']
         self.lwin_extra_met_vars = ['RH', 'TA']
         self.swin_extra_met_vars = ['PA']
+        self.precip_extra_met_vars = ['UX', 'VY']
         
         self.targ_var_depends = {}
         self.targ_var_depends['TA'] = ['landfrac', 'elev']
@@ -529,17 +652,15 @@ class data_generator():
         self.targ_var_depends['SWIN'] = ['landfrac', 'elev',
                                          'illumination_map',                                         
                                          'solar_altitude',
-                                         #'sunlight_hours',
                                          'cloud_cover'] + self.swin_extra_met_vars
-        self.targ_var_depends['LWIN'] = ['landfrac', #'elev',
-                                         #'sunlight_hours',
+        self.targ_var_depends['LWIN'] = ['landfrac',
                                          'sky_view_factor',
-                                         'land_cover',                                         
                                          'cloud_cover'] + self.lwin_extra_met_vars
         self.targ_var_depends['WS'] = ['landfrac', 'elev', 'stdev',
-                                       'slope', 'land_cover']
+                                       'aspect', 'slope', 'land_cover']
         self.targ_var_depends['RH'] = ['landfrac'] + self.rh_extra_met_vars
-        
+        self.targ_var_depends['PRECIP'] = ['landfrac', 'elev', 'cloud_cover',
+                                           'aspect'] + self.precip_extra_met_vars        
         
         ## deal with site data
         # load site metadata/locations
@@ -556,14 +677,13 @@ class data_generator():
         if load_site_data:
             # load site data
             self.site_data = provide_cosmos_met_data(self.site_metadata,
-                                                     self.var_name_map['fine'],
+                                                     self.var_name_map['fine'].values,
                                                      forcenew=False)
         self.site_metadata = self.site_metadata.site
 
         #if load_site_data:
-        #midas_vars = ['air_temperature', 'stn_pres', 'wind_speed', 'rltv_hum']
         midas_data = provide_midas_met_data(midas_metadata,
-                                            self.var_name_map['fine'],
+                                            self.var_name_map['fine'].values,
                                             forcenew=False)
 
         # rescale midas air temperature to Kelvin to match COSMOS and add to self.site_dat
@@ -574,31 +694,7 @@ class data_generator():
             self.site_metadata = pd.concat([
                 self.site_metadata, 
                 midas_metadata[midas_metadata['SITE_ID']==sid]], axis=0)
-        self.site_metadata = self.site_metadata.reset_index().drop('index', axis=1)        
-
-        ''' we need to remove the Ireland sites from here as we 
-        don't have the ancillary data for them currently
-        Probably also the scottish north islands? '''
-        lat_up = 55.3
-        lat_down = 53.0
-        lon_right = -5.4
-        lon_left = -8.3        
-        ireland_sites = self.site_metadata[
-            ((self.site_metadata['LATITUDE']>lat_down) & 
-             (self.site_metadata['LATITUDE']<lat_up) &
-             (self.site_metadata['LONGITUDE']>lon_left) &
-             (self.site_metadata['LONGITUDE']<lon_right))
-        ]
-        shetland_sites = self.site_metadata[self.site_metadata['LATITUDE']>59.5]
-        if load_site_data:
-            for sid in ireland_sites.SITE_ID:
-                self.site_data[sid] = None
-                self.site_data.pop(sid)
-            for sid in shetland_sites.SITE_ID:
-                self.site_data[sid] = None
-                self.site_data.pop(sid)
-        self.site_metadata = self.site_metadata[~self.site_metadata['SITE_ID'].isin(ireland_sites['SITE_ID'])]
-        self.site_metadata = self.site_metadata[~self.site_metadata['SITE_ID'].isin(shetland_sites['SITE_ID'])]
+        self.site_metadata = self.site_metadata.reset_index().drop('index', axis=1)
         
         # numericise site elevation
         self.site_metadata['ALTITUDE'] = self.site_metadata.ALTITUDE.astype(np.float32)
@@ -626,12 +722,42 @@ class data_generator():
                                                        parent_pixel_id = coarse_parent_pixel_id)
         missing_sites = self.site_metadata[self.site_metadata['parent_pixel_id'].isna()]['SITE_ID']
         self.site_metadata = self.site_metadata[~self.site_metadata['parent_pixel_id'].isna()]
+        
         if load_site_data:
             for sid in missing_sites: 
                 self.site_data.pop(sid)
                 midas_data[sid] = None
-            del(midas_data)
+            del(midas_data)                
+                                                
+        # remove sites for which we don't have static data (ireland, shetland)
+        lat_up = 55.3
+        lat_down = 53.0
+        lon_right = -5.4
+        lon_left = -8.3
+        ireland_sites = self.site_metadata[
+            ((self.site_metadata['LATITUDE']>lat_down) & 
+             (self.site_metadata['LATITUDE']<lat_up) &
+             (self.site_metadata['LONGITUDE']>lon_left) &
+             (self.site_metadata['LONGITUDE']<lon_right))
+        ]
+        shetland_sites = self.site_metadata[self.site_metadata['LATITUDE']>59.5]
+        if load_site_data:
+            for sid in ireland_sites.SITE_ID:
+                self.site_data[sid] = None
+                self.site_data.pop(sid)
+            for sid in shetland_sites.SITE_ID:
+                self.site_data[sid] = None
+                self.site_data.pop(sid)
+        self.site_metadata = self.site_metadata[~self.site_metadata['SITE_ID'].isin(ireland_sites['SITE_ID'])]
+        self.site_metadata = self.site_metadata[~self.site_metadata['SITE_ID'].isin(shetland_sites['SITE_ID'])]
+        
+        # trim down columns
+        self.site_metadata = self.site_metadata[
+            ['SITE_NAME', 'SITE_ID', 'LATITUDE', 'LONGITUDE', 'ALTITUDE',
+             'chess_y','chess_x', 'parent_pixel_id']
+         ]
                 
+        # define train, val and test sets
         self.train_years = dp.train_years
         self.val_years = dp.val_years
         self.heldout_years = dp.heldout_years
@@ -640,6 +766,7 @@ class data_generator():
                                                      holdoutfrac=0.1, random_state=22)        
         self.train_sites = train_sites
         self.heldout_sites = heldout_sites
+        
         
         if load_site_data:
             # normalise site data
@@ -661,60 +788,142 @@ class data_generator():
                 self.site_data[SID].loc[:, ['TA']] = (self.site_data[SID].loc[:, ['TA']] - 273.15 - nm.temp_mu) / nm.temp_sd
                 
                 # wind speed            
-                self.site_data[SID].loc[:, ['WS']] = (self.site_data[SID].loc[:, ['WS']] - nm.ws_mu) / nm.ws_sd                
+                self.site_data[SID].loc[:, ['WS']] = (self.site_data[SID].loc[:, ['WS']] - nm.ws_mu) / nm.ws_sd
+                # these can be negative due to directionality!
+                # careful with normalising them differently to WS and then attempting 
+                # to calculate loss on sqrt(UX^2 + VY^2) =?= WS
+                self.site_data[SID].loc[:, ['UX']] = (self.site_data[SID].loc[:, ['UX']]) / nm.ws_sd
+                self.site_data[SID].loc[:, ['VY']] = (self.site_data[SID].loc[:, ['VY']]) / nm.ws_sd
+
+                # precipitation
+                self.site_data[SID].loc[:, 'PRECIP'] = self.site_data[SID].loc[:, 'PRECIP'] / nm.precip_norm
+                self.site_data[SID].loc[:, 'PRECIP'] = self.site_data[SID].loc[:, 'PRECIP'].clip(lower=0) # get rid of negative precip                
 
             # resample site data to daily and note number of data points present
             self.site_points_present = {}
-            self.daily_site_data = {}
+            #self.daily_site_data = {}
             for SID in list(self.site_data.keys()):
                 self.site_points_present[SID] = self.site_data[SID].groupby(pd.Grouper(freq='D')).count()
-                self.daily_site_data[SID] = self.site_data[SID].resample('1D').mean()
-        
-        ## load hi res static data        
-        #self.height_grid = xr.open_dataset(hj_ancil_fldr+'/uk_ihdtm_topography+topoindex_1km.nc')
-        self.height_grid = xr.open_dataset(home_data_dir + '/height_map/topography_bng_1km.nc')
-        self.height_grid = self.height_grid.drop(['topi','stdtopi', 'fdepth','area']).load()        
-        self.elev_vars = ['elev', 'stdev', 'slope', 'aspect']
-        
-        # treat NaNs in height grid        
-        # 1: elev, sea NaNs should be elev==0        
-        self.height_grid.elev.values[np.isnan(self.height_grid.elev.values)] = 0
-        # 2: stdev, sea NaNs should be stdev==0        
-        self.height_grid.stdev.values[np.isnan(self.height_grid.stdev.values)] = 0
-        # 3: slope, sea NaNs should be slope==0
-        self.height_grid.slope.values[np.isnan(self.height_grid.slope.values)] = 0
-        # 4: aspect, sea NaNs are tricky, aspect is "straight up", stick with uniform noise
-        asp_mask = np.isnan(self.height_grid.aspect.values)
-        self.height_grid.aspect.values[asp_mask] =  np.random.uniform(
-            low=0, high=360, size=len(np.where(asp_mask)[0])
-        )
-        
-        # load land cover for wind speed / long wave radiation model
-        self.land_cover = load_landcover()
-        # invert (due to rasterio loading 'correct' way up'
-        self.land_cover = self.land_cover[:,::-1,:]
-        # and trim to size (this assumed land cover map is bigger!)
-        self.land_cover = self.land_cover[:,:len(self.fine_grid.y),:len(self.fine_grid.x)]
-        self.lcm_names = ['l_wooded', 'l_open', 'l_mountain-heath', 'l_urban']
-        
-        # load list of binary batches
-        self.bin_batches = {}
-        self.bin_batches['train'] = []
-        for year in dp.train_years:
-            self.bin_batches['train'] += glob.glob(f'{nz_train_path}/batches/*_{year}*.pkl')
-        self.bin_batches['val'] = []
-        for year in dp.val_years:
-            self.bin_batches['val'] += glob.glob(f'{nz_train_path}/batches/*_{year}*.pkl')
-        self.bin_batches['test'] = []
-        for year in dp.heldout_years:
-            self.bin_batches['test'] += glob.glob(f'{nz_train_path}/batches/*_{year}*.pkl')        
+                #self.daily_site_data[SID] = self.site_data[SID].resample('1D').mean()
         
         # indices in a dim_h x dim_h grid
         X1 = np.where(np.ones((self.dim_h, self.dim_h)))
         self.X1 = np.hstack([X1[0][...,np.newaxis],
-                             X1[1][...,np.newaxis]])# / (dg.dim_h-1)
+                             X1[1][...,np.newaxis]])        
+
+    def load_EA_rain_gauge_data(self, load_site_data=True, train_sites=None):
+        # load EA (SEPA?, NRW?) site data for precipitation downscaling
+        ea_site_meta = (pd.read_csv(ea_fldr + 'sites_info.csv')
+            .drop(['ELEVATION', 'PATH', 'START_DATE', 'END_DATE'], axis=1)
+        )
+        ea_site_elev = pd.read_csv(ea_fldr + '/site_elevation.csv')
         
+        # for each site find the 1km chess tile it sits within
+        # and grab 1km elevation (better to do 50m elevation...)
+        ea_chess_y = []
+        ea_chess_x = []
+        ea_coarse_parent_pixel_id = []
+        for i in ea_site_meta.index:
+            this_dat = ea_site_meta.loc[i]
+            ccyx = find_chess_tile(this_dat['LATITUDE'], this_dat['LONGITUDE'],
+                                   self.fine_grid)
+            ea_chess_y.append(ccyx[0][0])
+            ea_chess_x.append(ccyx[1][0])
+            try:
+                ea_coarse_parent_pixel_id.append(
+                    int(self.fine_grid.era5_nbr[ccyx[0][0], ccyx[1][0]].values)
+                )
+            except:
+                ea_coarse_parent_pixel_id.append(np.nan)
+
+        # add to site metadata but filter out missing vals            
+        ea_site_meta = ea_site_meta.assign(chess_y = ea_chess_y,
+                                           chess_x = ea_chess_x,
+                                           parent_pixel_id = ea_coarse_parent_pixel_id,
+                                           )                                           
+        ea_missing_sites = ea_site_meta[ea_site_meta['parent_pixel_id'].isna()]['SITE_ID']            
+        ea_site_meta = ea_site_meta[~ea_site_meta['parent_pixel_id'].isna()]            
         
+        if load_site_data:
+            ea_site_data = {}
+            ea_missing_sites2 = []
+            for sid in ea_site_meta.SITE_ID:
+                if Path(ea_fldr + f'/data_hourly/{sid}.parquet').exists():
+                    thisdat = pd.read_parquet(ea_fldr + f'/data_hourly/{sid}.parquet')
+                    try:
+                        thisdat = thisdat.rename({'PRECIPITATION': 'PRECIP'}, axis=1)
+                    except:
+                        pass
+                    for vv in np.setdiff1d(self.var_name_map['fine'].values, 'PRECIP'):
+                        thisdat[vv] = np.nan
+                    ea_site_data['EA_'+str(sid)] = thisdat
+                else:
+                    ea_missing_sites2.append(sid)
+            ea_site_meta = ea_site_meta.loc[~ea_site_meta.SITE_ID.isin(ea_missing_sites2)]
+            
+        ea_site_meta['SITE_ID'] = 'EA_' + ea_site_meta.SITE_ID.values.astype(str).astype(object)
+        ea_site_meta = ea_site_meta.merge(ea_site_elev, on=['SITE_ID', 'LATITUDE', 'LONGITUDE'])
+        ea_site_meta['ALTITUDE'] = ea_site_meta.ALTITUDE.astype(np.float32)
+        ea_site_meta = ea_site_meta.loc[~(abs(ea_site_elev.ALTITUDE) > 2000)]
+            
+        # trim down columns
+        ea_site_meta = ea_site_meta[
+            ['SITE_ID', 'LATITUDE', 'LONGITUDE', 'ALTITUDE',
+             'chess_y','chess_x', 'parent_pixel_id']
+         ]
+            
+        # remove sites for which we don't have static data (ireland, shetland)
+        lat_up = 55.3
+        lat_down = 53.0
+        lon_right = -5.4
+        lon_left = -8.3
+        ireland_sites = ea_site_meta[
+            ((ea_site_meta['LATITUDE']>lat_down) & 
+             (ea_site_meta['LATITUDE']<lat_up) &
+             (ea_site_meta['LONGITUDE']>lon_left) &
+             (ea_site_meta['LONGITUDE']<lon_right))
+        ]
+        shetland_sites = ea_site_meta[ea_site_meta['LATITUDE']>59.5]
+        if load_site_data:
+            for sid in ireland_sites.SITE_ID:
+                ea_site_data[sid] = None
+                ea_site_data.pop(sid)
+            for sid in shetland_sites.SITE_ID:
+                ea_site_data[sid] = None
+                ea_site_data.pop(sid)
+        ea_site_meta = ea_site_meta[~ea_site_meta['SITE_ID'].isin(ireland_sites['SITE_ID'])]
+        ea_site_meta = ea_site_meta[~ea_site_meta['SITE_ID'].isin(shetland_sites['SITE_ID'])]
+        
+        # define train, val and test sets
+        if train_sites is None:
+            train_sites, heldout_sites = site_splits(use_sites=list(ea_site_meta.SITE_ID),
+                                                     holdoutfrac=0.1, random_state=22)        
+        self.train_sites += train_sites
+        self.heldout_sites += heldout_sites
+        
+        if load_site_data:
+            # normalise site data
+            for SID in list(ea_site_data.keys()):
+                # precipitation
+                ea_site_data[SID].loc[:, 'PRECIP'] = ea_site_data[SID].loc[:, 'PRECIP'] / nm.precip_norm
+                ea_site_data[SID].loc[:, 'PRECIP'] = ea_site_data[SID].loc[:, 'PRECIP'].clip(lower=0) # get rid of negative precip                
+
+            # resample site data to daily and note number of data points present            
+            for SID in list(ea_site_data.keys()):
+                self.site_points_present[SID] = ea_site_data[SID].groupby(pd.Grouper(freq='D')).count()
+            
+        # add to master meta and data
+        self.site_metadata = pd.concat([self.site_metadata, ea_site_meta], axis=0)
+        if load_site_data:
+            for sid in list(ea_site_data.keys()):
+                self.site_data[sid] = ea_site_data.pop(sid)
+            
+            # trim suspect PRECIP values at all sites
+            # the 60-minute rainfall record in the UK is 92mm (from wikipedia)
+            precip_hour_thresh = 93 / nm.precip_norm
+            for sid in self.site_data.keys():
+                self.site_data[sid][self.site_data[sid].PRECIP >= precip_hour_thresh] = np.nan
+
     def find_1km_pixel(self, lat, lon):
         dist_diff = np.sqrt(np.square(self.fine_grid.lat.values - lat) +
                             np.square(self.fine_grid.lon.values - lon))
@@ -735,32 +944,32 @@ class data_generator():
         # load ERA5 data for that date and trim lat/lon
         era5_vars = self.var_name_map[(self.var_name_map['coarse']!='ws') &
                                       (self.var_name_map['coarse']!='rh')]['coarse']
-        era5_vars = list(era5_vars) + ['u10', 'v10', 'd2m']
+        era5_vars = list(era5_vars) + ['d2m']
                 
         era5_filelist = [f'{era5_fldr}/{var}/era5_{date_string}_{var}.nc' for var in era5_vars]
         
         era5_dat = xr.open_mfdataset(era5_filelist)
         
-        if False:
-            #self.era5_dat = xr.open_mfdataset(era5_filelist)
-            # because these are already on the BNG at 1km, find are averages of 25x25 squares        
-            self.parent_pixels[timestep] = self.parent_pixels[timestep].assign_coords(
-                {'time':self.era5_dat.time.values}
-            )
-            ys = self.parent_pixels[timestep].y.shape[0] - 1
-            xs = self.parent_pixels[timestep].x.shape[0] - 1
-            ts = self.parent_pixels[timestep].time.shape[0]
-            for var in era5_vars:
-                self.parent_pixels[timestep][var] = (['time', 'y', 'x'],
-                                          np.ones((ts, ys, xs), dtype=np.float32)*np.nan)
-                source = self.era5_dat[var].values
-                self.parent_pixels[timestep][var] = (('time', 'y', 'x'), 
-                    skimage.measure.block_reduce(
-                        source, (1, self.scale, self.scale), np.mean
-                    )[:ts,:ys,:xs] # trim right/bottom edges
-                )
-            del(source)
-            del(self.era5_dat)
+        # if False:
+            # #self.era5_dat = xr.open_mfdataset(era5_filelist)
+            # # because these are already on the BNG at 1km, find are averages of 25x25 squares        
+            # self.parent_pixels[timestep] = self.parent_pixels[timestep].assign_coords(
+                # {'time':self.era5_dat.time.values}
+            # )
+            # ys = self.parent_pixels[timestep].y.shape[0] - 1
+            # xs = self.parent_pixels[timestep].x.shape[0] - 1
+            # ts = self.parent_pixels[timestep].time.shape[0]
+            # for var in era5_vars:
+                # self.parent_pixels[timestep][var] = (['time', 'y', 'x'],
+                                          # np.ones((ts, ys, xs), dtype=np.float32)*np.nan)
+                # source = self.era5_dat[var].values
+                # self.parent_pixels[timestep][var] = (('time', 'y', 'x'), 
+                    # skimage.measure.block_reduce(
+                        # source, (1, self.scale, self.scale), np.mean
+                    # )[:ts,:ys,:xs] # trim right/bottom edges
+                # )
+            # del(source)
+            # del(self.era5_dat)
         
         ## if loading raw lat/lon projection
         # reproject and regrid onto 28km BNG
@@ -852,19 +1061,25 @@ class data_generator():
         sub_grid = self.fine_grid.isel(y=y_inds, x=x_inds)
         sub_topog = self.height_grid.isel(y=y_inds, x=x_inds)
         
-        if ('RH' in var) or ('LWIN' in var) or ('SWIN' in var): # those vars with extra met data as input
+        # those vars with extra met data as input
+        if ('RH' in var) or ('LWIN' in var) or ('SWIN' in var) or ('PRECIP' in var):
             if timestep=='daily':
                 sub_met_dat = self.chess_dat.isel(y=y_inds, x=x_inds)
             else:
                 sub_met_dat = self.met_fine.isel(y=y_inds, x=x_inds, time=it)
+
+        if ('LWIN' in var) or ('SWIN' in var) or ('PRECIP' in var):
+            sub_cloud_cover = self.tcc_1km.isel(y=y_inds, x=x_inds)
+            if timestep=='daily':
+                sub_cloud_cover = sub_cloud_cover.mean('time').values
+            else:
+                sub_cloud_cover = sub_cloud_cover.isel(time=it).values
                 
         if ('LWIN' in var) or ('SWIN' in var):
-            sub_cloud_cover = self.tcc_1km.isel(y=y_inds, x=x_inds)
             if timestep=='daily':
                 sub_sol_azimuth = self.sol_azi.isel(y=y_inds, x=x_inds)
                 sub_sol_altitude = self.sol_alt.isel(y=y_inds, x=x_inds)
                 sub_sun_hours = self.sun_hrs.isel(y=y_inds, x=x_inds)
-                sub_cloud_cover = sub_cloud_cover.mean('time').values
             else:
                 sub_sol_azimuth = self.sp.solar_azimuth_angle.isel(y=y_inds, x=x_inds)
                 sub_sol_altitude = self.sp.solar_elevation.isel(y=y_inds, x=x_inds)
@@ -872,7 +1087,6 @@ class data_generator():
                 sub_sun_hours.values = (sub_sun_hours.values > 0).astype(np.int32)                
                 # smooth edges to account for time resolution inaccuracy
                 sub_sun_hours.values = gaussian_filter(sub_sun_hours.values, sigma=15)
-                sub_cloud_cover = sub_cloud_cover.isel(time=it).values
         
         if 'LWIN' in var:
             sub_skyview = self.skyview_map.isel(y=y_inds, x=x_inds)            
@@ -885,7 +1099,6 @@ class data_generator():
                 sub_illum = self.solar_illum_map.isel(y=y_inds, x=x_inds)
                 sub_shade = self.shade_map.isel(y=y_inds, x=x_inds)
 
-
         ## normalise hi res data
         sub_topog['aspect'].values = sub_topog['aspect'].values / 360. - 0.5 # so goes between -0.5 and 0.5
         for vv in list(set(self.elev_vars) - set(['aspect'])):            
@@ -896,12 +1109,19 @@ class data_generator():
 
         # create tensors with batch index and channel dim last
         coarse_input = []
-        for v in var:
-            coarse_input.append(torch.from_numpy(
-                subdat[self.var_name_map.coarse.loc[v]].values).to(torch.float32))
-        coarse_input = torch.stack(coarse_input, dim=-1)        
-        # therefore coarse scale variable order (in cosmos parlance) is
-        self.coarse_variable_order = var
+        if var == ['WS']: # two-channel input for wind components
+            for v in ['u10', 'v10']:
+                coarse_input.append(torch.from_numpy(
+                    subdat[v].values).to(torch.float32)
+                )
+            self.coarse_variable_order = ['UX', 'VY']
+        else:
+            for v in var:
+                coarse_input.append(torch.from_numpy(
+                    subdat[self.var_name_map.coarse.loc[v]].values).to(torch.float32)
+                )
+            self.coarse_variable_order = var
+        coarse_input = torch.stack(coarse_input, dim=-1)
 
         # get static inputs at the high resolution
         fine_input = torch.from_numpy(sub_grid['landfrac'].values).to(torch.float32)[...,None]
@@ -950,24 +1170,14 @@ class data_generator():
                 # ], dim = -1)
             # self.fine_variable_order += ['solar_azimuth']
         
-        if ('LWIN' in var) or ('SWIN' in var):
-            # # turn into fraction of time period in sunlight
-            # if timestep=='daily':
-                # sub_sun_hours = sub_sun_hours.values / 24.
-            # else:
-                # sub_sun_hours = sub_sun_hours.values
-            # fine_input = torch.cat([fine_input,                
-                # torch.from_numpy(sub_sun_hours).to(torch.float32)[...,None]
-                # ], dim = -1)
-            # self.fine_variable_order += ['frac_time_sunlight']
-            
+        if ('LWIN' in var) or ('SWIN' in var) or ('PRECIP' in var):           
             # add cloud cover            
             fine_input = torch.cat([fine_input,                
                 torch.from_numpy(sub_cloud_cover).to(torch.float32)[...,None]
                 ], dim = -1)
             self.fine_variable_order += ['cloud_cover']
             
-        if ('LWIN' in var) or ('WS' in var):
+        if ('WS' in var): # or ('LWIN' in var)
             # add land cover classes (y axis inverted compared to other grids)
             #sub_lcm = self.land_cover[:, self.land_cover.shape[1]-1-y_inds, :][:, :, x_inds]
             # though we already invert and trim in __init__()
@@ -1010,6 +1220,17 @@ class data_generator():
                         ], dim = -1)
                     self.fine_variable_order += [exv]
             
+        if 'PRECIP' in var:
+            for exv in self.precip_extra_met_vars:
+                if not exv in self.fine_variable_order: # don't double count            
+                    if timestep=='daily': vname = self.var_name_map.loc[exv].chess
+                    else: vname = self.var_name_map.loc[exv].coarse
+                    fine_input = torch.cat([
+                        fine_input,
+                        torch.from_numpy(sub_met_dat[vname].values).to(torch.float32)[...,None]
+                        ], dim = -1)
+                    self.fine_variable_order += [exv]
+        
         # add lat/lon (always last two finescale inputs
         fine_input = torch.cat([fine_input,                            
                             torch.from_numpy(lat_grid).to(torch.float32)[...,None],
@@ -1021,9 +1242,9 @@ class data_generator():
                 lat_grid, lon_grid, timestamp)
 
     def get_station_targets(self, subdat, x_inds, y_inds, timestamp, 
-                            var, latlon_grid, batch_type='train',
+                            var, latlon_grid, fine_input, batch_type='train',
                             trim_edge_sites=True, context_frac=None,
-                            timestep='daily'):
+                            timestep='hourly'):
         # get station targets within the dim_l x dim_l tile,
         # ignoring stations on edge pixels       
         if trim_edge_sites:
@@ -1073,12 +1294,20 @@ class data_generator():
                 sites_npts.loc[sid, vv] = numpoints[vv]
         
         # define station targets
-        keep_vars = ['sub_x', 'sub_y'] + var + ['LATITUDE', 'LONGITUDE', 'ALTITUDE']        
+        if var[0]=='WS':
+            keep_vars = ['sub_x', 'sub_y'] + ['UX', 'VY'] + ['LATITUDE', 'LONGITUDE', 'ALTITUDE']
+            station_npts = sites_npts[['UX', 'VY']]
+        else:
+            keep_vars = ['sub_x', 'sub_y'] + var + ['LATITUDE', 'LONGITUDE', 'ALTITUDE']
+            station_npts = sites_npts[var]
         station_targets = contained_sites[keep_vars]
-        station_npts = sites_npts[var]
+        
         
         # trim sites with no data
-        keepsites = station_targets[var].dropna(how='all').index # check the how='all' here
+        if var[0]=='WS':
+            keepsites = station_targets[['UX', 'VY']].dropna().index
+        else:
+            keepsites = station_targets[var].dropna(how='all').index
         station_targets = station_targets.loc[keepsites]
         station_npts = station_npts.loc[keepsites]
         
@@ -1097,10 +1326,8 @@ class data_generator():
                 # no sites with 24 readings, return null batch                
                 val_dense_vecs = np.zeros((1, 2*len(var) + 3, 0), dtype=np.float32) # no null tag
                 YX_locs = np.zeros((0,2), dtype=np.float32)
-                return ({'context':station_targets,
-                         'target':station_targets},
-                         {'context':station_npts,
-                         'target':station_npts},
+                return ({'context':station_targets, 'target':station_targets},
+                         {'context':station_npts, 'target':station_npts},
                          val_dense_vecs, YX_locs)
                 
         # create context/target splits (randomising context fraction)
@@ -1113,21 +1340,68 @@ class data_generator():
         )
         
         # create value/density pairs (+ altitude) vector for context points
-        val_dense_vecs = np.zeros((1, 2*len(var) + 3, len(context)), dtype=np.float32)
+        '''
+        For Wind Components model, where we propose to predict 
+        both components in one model, we need to alter this 
+        so we can add both component values to the context data set.
+        This would also need an altered loss function that is aware 
+        of this!
+        '''
+        if var[0]=='WS':
+            self.context_variable_order = ['var_value_u', 'var_value_v', 'elev', 'lat', 'lon']
+        else:
+            self.context_variable_order = ['var_value', 'elev', 'lat', 'lon']
+            
+        if var[0]=='SWIN':
+            val_dense_vecs = np.zeros((1, 7, len(context)), dtype=np.float32) # add illum map, shade map, cloud cover
+            cloud_vec = []
+            shade_vec = []
+            illum_vec = []
+            self.context_variable_order = self.context_variable_order + ['cloud_cover', 'shade_map', 'illumination_map']
+        elif var[0]=='LWIN' or var[0]=='PRECIP':
+            val_dense_vecs = np.zeros((1, 5, len(context)), dtype=np.float32)
+            cloud_vec = []
+            self.context_variable_order = self.context_variable_order + ['cloud_cover']
+        elif var[0]=='WS':
+            val_dense_vecs = np.zeros((1, 2*len(var) + 3, len(context)), dtype=np.float32)
+        else:
+            val_dense_vecs = np.zeros((1, len(var) + 3, len(context)), dtype=np.float32)
+        
         for i, sid in enumerate(context):
             vardat = station_targets.loc[sid]
-            for jj, v in enumerate(var):
-                thisval = vardat[v]
-                if not np.isnan(thisval):                    
-                    val_dense_vecs[0,2*jj,i] = thisval
-                    val_dense_vecs[0,2*jj+1,i] = 1. # signifying we have a real observation. 0 if no observation. "Density"
-            jj = 2*len(var)
-            val_dense_vecs[0,jj,i] = (vardat.ALTITUDE - nm.s_means.elev) / nm.s_stds.elev
-            jj += 1
-            val_dense_vecs[0,jj  ,i] = vardat.LATITUDE / nm.lat_norm
-            val_dense_vecs[0,jj+1,i] = vardat.LONGITUDE / nm.lon_norm
-        
-        #if len(context)>0: ## actually only need this if we are using positional encodings?
+            if var[0]=='WS':
+                val_dense_vecs[0,0,i] = vardat['UX']
+                val_dense_vecs[0,1,i] = vardat['VY']
+                jj = 2
+            else:
+                val_dense_vecs[0,0,i] = vardat[var[0]]
+                jj = 1
+            
+            val_dense_vecs[0,jj  ,i] = (vardat.ALTITUDE - nm.s_means.elev) / nm.s_stds.elev
+            val_dense_vecs[0,jj+1,i] = vardat.LATITUDE / nm.lat_norm
+            val_dense_vecs[0,jj+2,i] = vardat.LONGITUDE / nm.lon_norm
+            
+            if var[0]=='SWIN' or var[0]=='LWIN' or var[0]=='PRECIP':
+                val_dense_vecs[0,jj+3,i] = fine_input[int(vardat.sub_y), int(vardat.sub_x), self.fine_variable_order.index('cloud_cover')]
+                cloud_vec.append(val_dense_vecs[0,jj+3,i])
+                             
+            if var[0]=='SWIN':
+                
+                val_dense_vecs[0,jj+4,i] = fine_input[int(vardat.sub_y), int(vardat.sub_x), self.fine_variable_order.index('shade_map')]
+                shade_vec.append(val_dense_vecs[0,jj+4,i])
+                
+                val_dense_vecs[0,jj+5,i] = fine_input[int(vardat.sub_y), int(vardat.sub_x), self.fine_variable_order.index('illumination_map')]
+                illum_vec.append(val_dense_vecs[0,jj+5,i])                
+
+        if var[0]=='SWIN' or var[0]=='LWIN' or var[0]=='PRECIP':
+            station_targets = station_targets.assign(cloud_cover = np.nan)
+            station_targets.loc[context, 'cloud_cover'] = cloud_vec
+        if var[0]=='SWIN':
+            station_targets = station_targets.assign(shade_map = np.nan)
+            station_targets.loc[context, 'shade_map'] = shade_vec
+            station_targets = station_targets.assign(illumination_map = np.nan)
+            station_targets.loc[context, 'illumination_map'] = illum_vec
+            
         if False:
             ## find off-grid YX locations of stations 
             ## (as floating point indices for positional encoding)
@@ -1171,11 +1445,11 @@ class data_generator():
         constraint = {}
         if 'TA' in var:
             c = self.t_1km_elev.isel(time=it, y=y_inds, x=x_inds)
-            c = (c - 273.15 - nm.temp_mu) / nm.temp_sd
+            c.values = (c.values - 273.15 - nm.temp_mu) / nm.temp_sd
             constraint['TA'] = c.values.copy()
         if 'PA' in var:
             c = self.p_1km_elev.isel(time=it, y=y_inds, x=x_inds)
-            c = (c - nm.p_mu) / nm.p_sd
+            c.values = (c.values - nm.p_mu) / nm.p_sd
             constraint['PA'] = c.values.copy()
         if 'SWIN' in var:
             ## Shortwave radiation, time of day dependent
@@ -1194,25 +1468,52 @@ class data_generator():
             self.Sw_1km = self.Sw_1km.clip(min=0) # get rid of negative swin
             
             c = self.Sw_1km.isel(y=y_inds, x=x_inds)
-            c = c / nm.swin_norm
+            c.values = c.values / nm.swin_norm
             constraint['SWIN'] = c.values.copy()
         if 'LWIN' in var:
             c = self.Lw_1km.isel(time=it, y=y_inds, x=x_inds)
-            c = (c - nm.lwin_mu) / nm.lwin_sd
+            c.values = (c.values - nm.lwin_mu) / nm.lwin_sd
             constraint['LWIN'] = c.values.copy()
         if 'WS' in var:
-            c = self.ws_1km_interp.isel(time=it, y=y_inds, x=x_inds)
-            c = (c - nm.ws_mu) / nm.ws_sd
-            constraint['WS'] = c.values.copy()
+            '''
+            Grab both wind components here and stack them on channel dim
+            '''
+            # c = self.ws_1km_interp.isel(time=it, y=y_inds, x=x_inds)
+            # c.values = (c.values - nm.ws_mu) / nm.ws_sd
+            # constraint['WS'] = c.values.copy()
+            c_x = self.ux_1km_interp.isel(time=it, y=y_inds, x=x_inds)            
+            c_x.values = c_x.values / nm.ws_sd
+            c_y = self.vy_1km_interp.isel(time=it, y=y_inds, x=x_inds)
+            c_y.values = c_y.values / nm.ws_sd
+            constraint['UX'] = c_x.values.copy()
+            constraint['VY'] = c_y.values.copy()
         if 'RH' in var:
             c = self.rh_1km_interp.isel(time=it, y=y_inds, x=x_inds)
-            c = (c - nm.rh_mu) / nm.rh_sd
+            c.values = (c.values - nm.rh_mu) / nm.rh_sd
             constraint['RH'] = c.values.copy()
-        return [torch.from_numpy(constraint[v]).to(torch.float32) for v in var]
+        if 'PRECIP' in var:
+            ## LOAD CEH-GEAR data for the date/time, or do this prior
+            ## to share dataset between same-day timepoints            
+            fine_sub = self.fine_grid.isel(y=y_inds, x=x_inds)         
+            c = (self.gear.sel(y=fine_sub.y, x=fine_sub.x)
+                .isel(time=it)
+                .rainfall_amount
+            )
+            # infill sea NaNs with ERA5 precip interp, might need to transform precip interp to mm
+            sea_mask = np.isnan(c.values)
+            c.values[sea_mask] = (self.precip_1km_interp
+                .isel(y=y_inds, x=x_inds, time=it)
+                .values[sea_mask]
+            ) * 3600 # kg m2 s-1 to mm
+            c.values = c.values / nm.precip_norm
+            c = c.clip(min=0) # get rid of negative rain
+            constraint['PRECIP'] = c.values.copy()
+                        
+        return [torch.from_numpy(constraint[v]).to(torch.float32) for v in constraint.keys()]
 
     def get_sample(self, var, batch_type='train',
                    context_frac=None, 
-                   timestep='daily',
+                   timestep='hourly',
                    sample_xyt=True,
                    ix=None, iy=None, it=None,
                    return_constraints=True,
@@ -1239,6 +1540,7 @@ class data_generator():
             station_data, context_locations) = self.get_station_targets(
             subdat, x_inds, y_inds, timestamp, var,
             np.stack([lat_grid, lon_grid], axis=0),
+            fine_input,
             batch_type=batch_type,
             context_frac=context_frac,            
             timestep=timestep            
@@ -1255,7 +1557,7 @@ class data_generator():
                     )
             else:
                 ## use physically reasoned constraints
-                constraints = self.get_constraints(x_inds, y_inds, it, var)
+                constraints = self.get_constraints(x_inds, y_inds, it, var)               
         else:
             constraints.append(torch.zeros((0,0)).to(torch.float32))
         constraints = torch.stack(constraints, dim=-1)
@@ -1270,18 +1572,20 @@ class data_generator():
             'coarse_yt':iy,
             'timestep':timestep,
             'fine_var_order':self.fine_variable_order,
-            'coarse_var_order':self.coarse_variable_order
+            'coarse_var_order':self.coarse_variable_order,
+            'context_var_order':self.context_variable_order
         }
                 
-        return {'in_coarse':coarse_input,
-                'in_fine':fine_input,
-                'station_data':station_data,
-                'station_metadata':station_targets,
-                'constraints':constraints,
-                'context_locs':context_locations,
-                'station_num_obs':station_npts,
-                'sample_meta':sample_meta
-                }
+        return {
+            'in_coarse':coarse_input,
+            'in_fine':fine_input,
+            'station_data':station_data,
+            'station_metadata':station_targets,
+            'constraints':constraints,
+            'context_locs':context_locations,
+            'station_num_obs':station_npts,
+            'sample_meta':sample_meta
+        }
 
     def prepare_constraints(self, var):
         '''
@@ -1312,6 +1616,7 @@ class data_generator():
                 self.t_1km_elev = t_sealevel_interp + self.height_grid['elev'] * lapse_val
                 self.t_1km_elev = self.t_1km_elev.transpose('time', 'y', 'x')
                 self.t_1km_elev.load()
+                self.t_1km_elev = reflect_pad_nans(self.t_1km_elev.copy())
                 
                 # rescale to counteract errors in physical downscaling assumptions
                 self.t_1km_elev = scale_by_coarse_data(
@@ -1331,6 +1636,7 @@ class data_generator():
                 self.p_1km_elev = p_1 * np.exp(-g * self.height_grid['elev'] / (R * T_av))
                 self.p_1km_elev = self.p_1km_elev.transpose('time', 'y', 'x')
                 self.p_1km_elev.load()
+                self.p_1km_elev = reflect_pad_nans(self.p_1km_elev.copy())
                 del(T_av)
                 del(t_sealevel_interp)
                 
@@ -1351,6 +1657,7 @@ class data_generator():
                     self.fine_grid, coords=['lat', 'lon'])                
                 self.rh_1km_interp = self.rh_1km_interp.transpose('time', 'y', 'x')
                 self.rh_1km_interp.load()
+                self.rh_1km_interp = reflect_pad_nans(self.rh_1km_interp.copy())
                 
                 # rescale to counteract errors in physical downscaling assumptions
                 self.rh_1km_interp = scale_by_coarse_data(
@@ -1391,7 +1698,7 @@ class data_generator():
                 #   On the determination of atmospheric longwave irradiance under all-sky conditions
                 #   Sol. Energy, 144 (2017), pp. 40-48
                 emms_28km = 1.02 * (1 - np.exp(-ea_28km*(
-                    self.parent_pixels['hourly']['t2m']/1564.94)))                
+                    self.parent_pixels['hourly'][self.var_name_map.loc['TA'].coarse]/1564.94)))                
                 emms_28km_interp = interp_to_grid(emms_28km, self.fine_grid, coords=['lat', 'lon'])
                 
                 emms_1km = 1.02 * (1 - np.exp(-ea_1km*(self.t_1km_elev/1564.94)))
@@ -1408,7 +1715,7 @@ class data_generator():
                     # (though really it should be higher up temperature 
                     # rather than surface temp?)                    
                     t_28km_interp = interp_to_grid(
-                        self.parent_pixels['hourly']['t2m'],
+                        self.parent_pixels['hourly'][self.var_name_map.loc['TA'].coarse],
                         self.fine_grid, coords=['lat', 'lon']
                     )
                     
@@ -1420,8 +1727,8 @@ class data_generator():
                     self.Lw_1km = emms_ratio * Lw_28km_interp        
 
                 self.Lw_1km = self.Lw_1km.transpose('time', 'y', 'x')
-
                 self.Lw_1km.load()
+                self.Lw_1km = reflect_pad_nans(self.Lw_1km.copy())
                 
                 # rescale to counteract errors in physical downscaling assumptions
                 self.Lw_1km = scale_by_coarse_data(
@@ -1432,31 +1739,79 @@ class data_generator():
                 )
                             
             if 'WS' in var:
-                ## Wind speed. Simply interpolate this....            
-                self.ws_1km_interp = interp_to_grid(
-                    self.parent_pixels['hourly']['ws'],
-                    self.fine_grid, coords=['lat', 'lon']
-                )                
+                ## Wind speed. Simply interpolate this....
+                '''
+                Interpolate both components, u10 and v10!
+                '''         
+                # self.ws_1km_interp = interp_to_grid(
+                    # self.parent_pixels['hourly'][self.var_name_map.loc['WS'].coarse],
+                    # self.fine_grid, coords=['lat', 'lon']
+                # )
+                # self.ws_1km_interp = self.ws_1km_interp.transpose('time', 'y', 'x')
+                # self.ws_1km_interp.load()
+                # self.ws_1km_interp = reflect_pad_nans(self.ws_1km_interp.copy())
                 
-                # add_chess_structure = False
-                # if add_chess_structure:
-                    # # add a weighted version of the chess wind for spatial structure
-                    # chess_day_wind = self.chess_dat[self.var_name_map.loc['WS'].chess].interp_like(
-                        # self.fine_grid, method='linear')
-                    # self.ws_1km_interp = (chess_day_wind + 2 * self.ws_1km_interp)/3.
-
-                self.ws_1km_interp = self.ws_1km_interp.transpose('time', 'y', 'x')
-                self.ws_1km_interp.load()
+                # # rescale to counteract errors in physical downscaling assumptions
+                # self.ws_1km_interp = scale_by_coarse_data(
+                    # self.ws_1km_interp.copy(),
+                    # self.parent_pixels['hourly'][self.var_name_map.loc['WS'].coarse],
+                    # self.fine_grid,
+                    # self.scale
+                # )
+                
+                self.ux_1km_interp = interp_to_grid(
+                    self.parent_pixels['hourly'][self.var_name_map.loc['UX'].coarse],
+                    self.fine_grid, coords=['lat', 'lon']
+                )
+                self.ux_1km_interp = self.ux_1km_interp.transpose('time', 'y', 'x')
+                self.ux_1km_interp.load()
+                self.ux_1km_interp = reflect_pad_nans(self.ux_1km_interp.copy())
                 
                 # rescale to counteract errors in physical downscaling assumptions
-                self.ws_1km_interp = scale_by_coarse_data(
-                    self.ws_1km_interp.copy(),
-                    self.parent_pixels['hourly'][self.var_name_map.loc['WS'].coarse],
+                self.ux_1km_interp = scale_by_coarse_data(
+                    self.ux_1km_interp.copy(),
+                    self.parent_pixels['hourly'][self.var_name_map.loc['UX'].coarse],
                     self.fine_grid,
                     self.scale
                 )
+                
+                self.vy_1km_interp = interp_to_grid(
+                    self.parent_pixels['hourly'][self.var_name_map.loc['VY'].coarse],
+                    self.fine_grid, coords=['lat', 'lon']
+                )
+                self.vy_1km_interp = self.vy_1km_interp.transpose('time', 'y', 'x')
+                self.vy_1km_interp.load()
+                self.vy_1km_interp = reflect_pad_nans(self.vy_1km_interp.copy())
+                
+                # rescale to counteract errors in physical downscaling assumptions
+                self.vy_1km_interp = scale_by_coarse_data(
+                    self.vy_1km_interp.copy(),
+                    self.parent_pixels['hourly'][self.var_name_map.loc['VY'].coarse],
+                    self.fine_grid,
+                    self.scale
+                )
+            
+            if 'PRECIP' in var:
+                # interpolate ERA5 to fill in the NaNs in 
+                self.precip_1km_interp = interp_to_grid(
+                    self.parent_pixels['hourly'][self.var_name_map.loc['PRECIP'].coarse],
+                    self.fine_grid, coords=['lat', 'lon']
+                )
+                self.precip_1km_interp = self.precip_1km_interp.transpose('time', 'y', 'x')
+                self.precip_1km_interp.load()
+                self.precip_1km_interp = reflect_pad_nans(self.precip_1km_interp.copy())                
+                
+                # rescale to counteract errors in physical downscaling assumptions
+                # Do we want this for the precip? might not make sense for GEAR field
+                # self.precip_1km_interp = scale_by_coarse_data(
+                    # self.precip_1km_interp.copy(),
+                    # self.parent_pixels['hourly'][self.var_name_map.loc['PRECIP'].coarse],
+                    # self.fine_grid,
+                    # self.scale
+                # )
+                
 
-    def prepare_era5_pixels(self, var, batch_tsteps='daily', constraints=True):
+    def prepare_era5_pixels(self, var, batch_tsteps='hourly', constraints=True):
         if batch_tsteps=='daily':
             ## average over the day
             self.parent_pixels['daily'] = self.parent_pixels['hourly'].mean('time')
@@ -1479,6 +1834,8 @@ class data_generator():
             if constraints:
                 # this requires particular units - do before changing them!
                 self.prepare_constraints(var)
+        
+        ## load other large grids that we only wan to load once per batch
         if 'SWIN' in var:
             # terrain shading used in hourly AND daily
             doy = self.td.day_of_year - 1 # zero indexed
@@ -1487,26 +1844,48 @@ class data_generator():
             self.sea_shading_array = np.load(
                 nz_train_path + f'/terrain_shading/sea_shading_mask_day_{doy}_merged_to_7999.npy')
                 
-        if ('SWIN' in var) or ('LWIN' in var):
+        if ('SWIN' in var) or ('LWIN' in var) or ('PRECIP' in var) :
             # cloud cover
             tcc = xr.open_dataset(era5_fldr + f'/tcc/era5_{self.td.year}{zeropad_strint(self.td.month)}{zeropad_strint(self.td.day)}_tcc.nc')
             self.tcc_1km = interp_to_grid(tcc.tcc, self.fine_grid, coords=['lat', 'lon'])
             self.tcc_1km = reflect_pad_nans(self.tcc_1km.copy())
         
+        if ('PRECIP' in var):
+            self.gear = xr.open_dataset(precip_fldr + f'/{self.td.year}/CEH-GEAR-1hr-v2_{self.td.year}{zeropad_strint(self.td.month)}.nc')
+            # label centre of pixel
+            self.gear['x'] = self.gear.x + 500
+            self.gear['y'] = self.gear.y + 500
+            # subset to domain
+            self.gear = self.gear.sel(
+                x = np.intersect1d(self.gear.x, self.fine_grid.x),
+                y = np.intersect1d(self.gear.y, self.fine_grid.y)
+            )
+            # subset to day
+            day_inds = np.where(pd.to_datetime(self.gear.time.values, utc=True).day == self.td.day)[0]
+            self.gear = self.gear.isel(time = day_inds)
+            
         ## change units
         self.parent_pixels[tstep]['t2m'].values -= 273.15 # K -> Celsius 
         self.parent_pixels[tstep]['d2m'].values -= 273.15 # K -> Celsius
         self.parent_pixels[tstep]['sp'].values /= 100.    # Pa -> hPa
+        self.parent_pixels[tstep]['mtpr'].values *= 3600. # kg m2 s-1 -> mm in hour
         
-        self.parent_pixels[tstep] = self.parent_pixels[tstep].drop(['u10', 'v10', 'd2m'])
+        #self.parent_pixels[tstep] = self.parent_pixels[tstep].drop(['u10', 'v10', 'd2m'])
+        self.parent_pixels[tstep] = self.parent_pixels[tstep].drop(['d2m'])
         
         ## normalise ERA5        
         self.parent_pixels[tstep]['t2m'].values = (self.parent_pixels[tstep]['t2m'].values - nm.temp_mu) / nm.temp_sd        
         self.parent_pixels[tstep]['sp'].values = (self.parent_pixels[tstep]['sp'].values - nm.p_mu) / nm.p_sd        
         self.parent_pixels[tstep]['msdwlwrf'].values = (self.parent_pixels[tstep]['msdwlwrf'].values - nm.lwin_mu) / nm.lwin_sd        
         self.parent_pixels[tstep]['msdwswrf'].values = self.parent_pixels[tstep]['msdwswrf'].values / nm.swin_norm
-        self.parent_pixels[tstep]['ws'].values = (self.parent_pixels[tstep]['ws'].values - nm.ws_mu) / nm.ws_sd        
+        self.parent_pixels[tstep]['ws'].values = (self.parent_pixels[tstep]['ws'].values - nm.ws_mu) / nm.ws_sd
+        self.parent_pixels[tstep]['u10'].values = (self.parent_pixels[tstep]['u10'].values) / nm.ws_sd
+        self.parent_pixels[tstep]['v10'].values = (self.parent_pixels[tstep]['v10'].values) / nm.ws_sd
         self.parent_pixels[tstep]['rh'].values = (self.parent_pixels[tstep]['rh'].values - nm.rh_mu) / nm.rh_sd
+        self.parent_pixels[tstep]['mtpr'].values = self.parent_pixels[tstep]['mtpr'].values / nm.precip_norm
+        
+        self.parent_pixels[tstep]['msdwswrf'] = self.parent_pixels[tstep]['msdwswrf'].clip(min=0)
+        self.parent_pixels[tstep]['mtpr'] = self.parent_pixels[tstep]['mtpr'].clip(min=0)
         
         ## drop variables we don't need
         self.era5_var = list(self.var_name_map.loc[var].coarse)
@@ -1528,6 +1907,15 @@ class data_generator():
                 cvar = self.var_name_map.loc[exvar].coarse
                 if cvar in to_drop:
                     to_drop.remove(cvar)
+        if 'PRECIP' in var:
+            for exvar in self.precip_extra_met_vars:
+                cvar = self.var_name_map.loc[exvar].coarse
+                if cvar in to_drop:
+                    to_drop.remove(cvar)
+        if 'WS' in var:
+            to_drop.remove('u10')
+            to_drop.remove('v10')
+            
         self.parent_pixels[tstep] = self.parent_pixels[tstep].drop(to_drop)
         
         # load data
@@ -1548,6 +1936,9 @@ class data_generator():
             fmi = True
         if 'SWIN' in var:
             extra_met_vars += self.swin_extra_met_vars
+            fmi = True
+        if 'PRECIP' in var:
+            extra_met_vars += self.precip_extra_met_vars
             fmi = True
         extra_met_vars = list(set(extra_met_vars))
         if fmi:
@@ -1581,10 +1972,6 @@ class data_generator():
                             land_mask = ~np.isnan(self.p_1km_elev.values)
                             self.met_fine[self.var_name_map.loc[xtrvar].coarse].values[land_mask] =\
                                 (self.p_1km_elev.values[land_mask] - nm.p_mu) / nm.p_sd
-                        # if xtrvar=='RH': # rh_1km is just interped anyway!
-                            # land_mask = ~np.isnan(self.rh_1km_interp.values)
-                            # self.met_fine[self.var_name_map.loc[xtrvar].coarse].values[land_mask] =\
-                                # (self.rh_1km_interp.values[land_mask] - nm.rh_mu) / nm.rh_sd
                 ## then as fine input we use self.met_fine for hourly samples
                 ## and self.chess_dat for daily samples
     
@@ -1602,7 +1989,7 @@ class data_generator():
                 self.sol_ilum.values.fill(0)
                 self.av_shade_map.values.fill(1)
                 sun_hours = []
-            for tt in range(0,24):
+            for tt in range(0, 24):
                 sp = SolarPosition(self.td + datetime.timedelta(hours=tt) - datetime.timedelta(minutes=30), timezone=0) # utc
                 sp.calc_solar_angles(self.fine_grid.lat, self.fine_grid.lon)
                 dayhour = (sp.solar_elevation.values > 0).astype(np.int32)
@@ -1635,7 +2022,7 @@ class data_generator():
             pass
     
     def get_batch(self, var, batch_size=1, batch_type='train',
-                  load_binary_batch=False, context_frac=None, p_hourly=1,
+                  context_frac=None, p_hourly=1,
                   date=None, parent_pixel_ids=[], times=[]):
         ''' 
         when using date, parent_pixel_ids, times to select batches,
@@ -1651,37 +2038,12 @@ class data_generator():
         if type(var)==str: var = [var]
         
         self.parent_pixels = {}
-        if load_binary_batch is False:
-            if date is None:
-                self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type)
-            else:                
-                self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type,
-                                                                          date_string=date_string)
-                self.td = pd.to_datetime(self.parent_pixels['hourly'].time[0].values, utc=True)
-        else:
-            got_batch = False
-            if not date is None:
-                # try to read specific date. if fail, select a random date
-                try:
-                    with Timeout(10):        
-                        bfn = nz_train_path + f'/batches/era5_bng_25km_pixels_{date_string}.pkl'
-                        self.parent_pixels['hourly'] = pd.read_pickle(bfn)
-                        got_batch = True
-                except Timeout.Timeout:
-                    got_batch = False            
-            while got_batch==False:
-                try:
-                    with Timeout(10):        
-                        bfn = self.bin_batches[batch_type][np.random.randint(0, len(self.bin_batches[batch_type]))]
-                        self.parent_pixels['hourly'] = pd.read_pickle(bfn)
-                        got_batch = True
-                except Timeout.Timeout:
-                    got_batch = False
-            # define self.td as the date we are working with
-            try:
-                self.td = pd.to_datetime(bfn.split('_')[-1].replace('.pkl',''), format='%Y%m%d', utc=True)
-            except:
-                self.td = pd.to_datetime(self.parent_pixels['hourly'].time[0].values, utc=True)
+        if date is None:
+            self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type)
+        else:                
+            self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type,
+                                                                      date_string=date_string)
+            self.td = pd.to_datetime(self.parent_pixels['hourly'].time[0].values, utc=True)
         
         ## work out the timesteps of the batch        
         batch_timesteps = np.random.choice(['daily', 'hourly'], batch_size,
@@ -1727,7 +2089,7 @@ class data_generator():
         station_targets = []
         station_data = []
         station_num_obs = []
-        constraint_targets = []        
+        constraint_targets = []
         context_locations = []
         batch_metadata = []
         for b in range(batch_size):
@@ -1764,18 +2126,19 @@ class data_generator():
         constraint_targets = torch.stack(constraint_targets, dim=0)
         station_data = [torch.from_numpy(a).type(torch.float32) for a in station_data]
         context_locations = [torch.from_numpy(a).type(torch.float32) for a in context_locations]
-                
+        
+        # output tensors as (B, C, Y, X)
         return {'coarse_inputs':coarse_inputs.permute(0,3,1,2),
                 'fine_inputs':fine_inputs.permute(0,3,1,2),
                 'constraints':constraint_targets.permute(0,3,1,2),
                 'station_targets':station_targets,
                 'station_data':station_data,
                 'station_num_obs':station_num_obs,
-                'context_locations':context_locations,                
+                'context_locations':context_locations,          
                 'batch_metadata':batch_metadata
                 }    
 
-    def get_all_space(self, var, batch_type='train', load_binary_batch=False,
+    def get_all_space(self, var, batch_type='train',
                       context_frac=None, date_string=None, it=None,
                       timestep='hourly', tile=False, min_overlap=1,
                       return_constraints=False):
@@ -1784,30 +2147,11 @@ class data_generator():
         self.parent_pixels = {}
         
         if date_string is None:            
-            if load_binary_batch is False:
-                self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type)            
-                self.td = pd.to_datetime(self.parent_pixels[timestep].time[0].values, utc=True)
-            else:
-                got_batch = False
-                while got_batch==False:
-                    try:
-                        with Timeout(10):        
-                            bfn = self.bin_batches[batch_type][np.random.randint(0, len(self.bin_batches[batch_type]))]
-                            self.parent_pixels['hourly'] = pd.read_pickle(bfn)
-                            got_batch = True
-                    except Timeout.Timeout:
-                        got_batch = False
-                try:
-                    self.td = pd.to_datetime(bfn.split('_')[-1].replace('.pkl',''), format='%Y%m%d', utc=True)
-                except:
-                    self.td = pd.to_datetime(self.parent_pixels['hourly'].time[0].values, utc=True)
+            self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type)            
+            self.td = pd.to_datetime(self.parent_pixels[timestep].time[0].values, utc=True)
         else:
-            if load_binary_batch is False:
-                self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type,
-                                                                          date_string=date_string)                
-            else:
-                bfn = f'{nz_train_path}/batches/era5_bng_25km_pixels_{date_string}.pkl'                
-                self.parent_pixels['hourly'] = pd.read_pickle(bfn)                
+            self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type,
+                                                                      date_string=date_string)               
             self.td = pd.to_datetime(date_string, format='%Y%m%d', utc=True)        
         
         if (timestep!='hourly'):
@@ -1916,7 +2260,8 @@ class data_generator():
         constraint_targets = torch.stack(constraint_targets, dim=0) 
         station_data = [torch.from_numpy(a).type(torch.float32) for a in station_data]
         context_locations = [torch.from_numpy(a).type(torch.float32) for a in context_locations]
-                
+        
+        # output tensors as (B, C, Y, X)
         return {'coarse_inputs':coarse_inputs.permute(0,3,1,2),
                 'fine_inputs':fine_inputs.permute(0,3,1,2),
                 'constraints':constraint_targets.permute(0,3,1,2),       
@@ -1932,19 +2277,17 @@ class data_generator():
 if __name__=="__main__":
     if False:
         pass
-        dg = data_generator()
+        dg = data_generator(precip_sutes=True)
         
-        batch_size = 5
+        batch_size = 3
         batch_type = 'train'
-        load_binary_batch = False
         p_hourly = 1.0
-        #var = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']
-        var = 'SWIN'
+        #var = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
+        var = 'WS'
                 
         batch = dg.get_batch(var,
                            batch_size=batch_size,
                            batch_type=batch_type,
-                           load_binary_batch=load_binary_batch,
                            p_hourly=p_hourly)            
 
         b = 4
@@ -1953,148 +2296,31 @@ if __name__=="__main__":
         ax[0].imshow(batch['coarse_inputs'].cpu().numpy()[b,0,::-1,:])
         ax[1].imshow(batch['constraints'].cpu().numpy()[b,0,::-1,:])
         plt.show()
-        
-        
-        
-        date_string = "20170101"
-        it = 10
-        tile = False
-        context_frac = 0.7
-        constraints = True
-        batch = dg.get_all_space(var, batch_type='train',
-                                 load_binary_batch=False,
-                                 context_frac=context_frac,
-                                 date_string=date_string, it=it,
-                                 timestep='hourly',
-                                 tile=tile,
-                                 return_constraints=constraints)
-            
-        # ## Shortwave radiation, time of day dependent
-        #it = batch['batch_metadata'][3]['t_ind']
-        timestamp = pd.to_datetime(dg.parent_pixels['hourly'].time.values[it], utc=True)
-        # take the mid-point of the hour for the solar position calc
-        dg.sp = SolarPosition(timestamp - datetime.timedelta(minutes=30), timezone=0) # utc
-        dg.sp.calc_solar_angles(dg.fine_grid.lat, dg.fine_grid.lon)
-                
-        swin_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['SWIN'].coarse][it,:,:] * nm.swin_norm
-        fine_grid = dg.fine_grid
-        sp = dg.sp
-        press_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu
-        press_fine = dg.p_1km_elev[it,:,:]
-        height_grid = dg.height_grid
-        shading_array = dg.shading_array[it,:]
-        sea_shading_array = dg.sea_shading_array[it,:]
-        scale = dg.scale
-        sky_view_factor = dg.skyview_map
-        
-        # A Physically Based Atmospheric Variables Downscaling Technique,
-        # TASNUVA ROUF et al. (2019)
-        
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            ## calculate diffuse fraction
-            I0 = 1361.5 # solar constant, W m-2            
-            sw_in = interp_to_grid(swin_coarse, fine_grid, coords=['lat', 'lon'])        
-            sw_in = reflect_pad_nans(sw_in.load().copy())        
-                    
-            '''
-            this method of partitioning does not work for solar elevation
-            <~ +- 6 degrees!
-            What do we do around sunrise and sunset?
-            
-            And should we actually be using the average solar position
-            at the half hour mark rather than the on-the-hour timestamp?
-            
-            And should we add an approximate reflected radiation term?
-            '''
-            # the clearness index, ratio of cloud top solar to surface incident solar rad
-            kt = fine_grid.landfrac.copy()
-            kt.values = sw_in.values / (I0 * np.cos(np.deg2rad(sp.solar_zenith_angle.values)))
-            kt = kt.clip(min=0, max=1)
-            ma = (90 - sp.solar_zenith_angle.values) <= 6
-            kt_pert = fine_grid.landfrac.copy()
-            kt_pert.values[:,:] = 1
-            kt_pert.values[ma] = (90 - sp.solar_zenith_angle.values)[ma] / 6.
-            kt_pert = kt_pert.clip(min=0, max=1)
-            kt.values = kt.values * kt_pert.values
-            
-            # diffuse fraction
-            # from Proposal of a regressive model for the hourly diffuse
-            # solar radiation under all sky conditions, J.A. Ruiz-Arias, 2010
-            k = 0.952 - 1.041 * np.exp(-np.exp(2.300 - 4.702*kt))
-            
-            ## partitioning into direct and diffuse
-            S_dir = sw_in * (1 - k)
-            S_dif = sw_in * k
-            
-            ### adjustments to SW components
-            ## diffuse
-            S_dif.values *= sky_view_factor.values
-            
-            ## direct
-            # terrain illumination/shading
-            cos_solar_illum = calculate_illumination_map(sp, fine_grid, height_grid)
-
-            # add shade map        
-            shade_map = (fine_grid.landfrac.copy()).astype(np.float32)        
-            shade_map.values[fine_grid.landfrac.values>0] = -(shading_array-1) # invert shade to zero
-            shade_map.values[fine_grid.landfrac.values==0] = -(sea_shading_array-1) # invert shade to zero
-            
-            # broadband attenuation
-            press_coarse.load()
-            p_interp = interp_to_grid(press_coarse, fine_grid, coords=['lat', 'lon'])        
-            p_interp = reflect_pad_nans(p_interp.load().copy())
-            
-            mask = sp.solar_zenith_angle <= 90
-            broadband_attenuation = fine_grid.landfrac.copy()
-            broadband_attenuation.values[:,:] = 0
-            broadband_attenuation.values[mask] = - (
-                (np.log(I0 * np.cos(np.deg2rad(sp.solar_zenith_angle.values[mask])) + EPS) - 
-                    np.log(S_dir.values[mask] + EPS)) / p_interp.values[mask]
-            )
-            
-            press_fine = reflect_pad_nans(press_fine.load().copy())
-            S_dir.values *= shade_map.values * cos_solar_illum.values * np.exp(broadband_attenuation.values * (press_fine.values - p_interp.values))        
-            
-            ## reflected
-            # Modeling Topographic Solar Radiation Using GOES Data, R. Dubayah and S. Loechel
-            terrain_config_factor = 0.5*(1 + np.cos(np.deg2rad(height_grid.slope.values))) - sky_view_factor
-            albedo = 0.23 # chess PE assumption across the UK... bad! satellite data?
-            
-            S_dir = S_dir.clip(min=0)
-            S_dif = S_dif.clip(min=0)
-            S_ref = albedo * terrain_config_factor * (S_dir + (1-sky_view_factor) * S_dif)
-            
-            # final SW 1km
-            Sw_1km = S_dir + S_dif + S_ref
-            
-            # renorm to match the input coarse SWIN to counteract errors in partitioning
-            Sw_1km = scale_by_coarse_data(Sw_1km.copy(), swin_coarse, fine_grid, scale)
-            
-                
-                
-
-        
-        
-        ##############
+    
+        #############################################
+        #############################################
         ## create dictionaries of dates/times that contain 
         ## representative samples for a spread of quantikes
         ## for each variable so we can create balanced batches
-        dg = data_generator()
+        dg = data_generator(precip_sites=True)
         all_site_data = pd.DataFrame()
         submeta = dg.site_metadata[['SITE_ID', 'chess_y', 'chess_x', 'parent_pixel_id']]
         submeta.loc[:,'parent_pixel_id'] = submeta['parent_pixel_id'].astype(np.int32)
         sites = list(dg.site_data.keys())
         for sid in sites:
-            site_dat = dg.site_data.pop(sid).dropna(how='all').assign(SITE_ID=sid).reset_index()
+            site_dat = (dg.site_data.pop(sid)
+                .dropna(how='all')
+                .assign(SITE_ID=sid)
+                .reset_index() # [['DATE_TIME', 'SITE_ID', 'PRECIP']]
+            )
             site_dat = site_dat.merge(submeta, on='SITE_ID', how='left') 
             all_site_data = pd.concat([all_site_data, site_dat], axis=0)        
         
         # look at quantiles of variables
-        qs = {}
-        qlist = [0, 0.025, 0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.95, 0.975, 1]
-        for qq in qlist:
-            qs[str(qq)] = all_site_data[list(dg.var_name_map.fine)].quantile(qq)
+        # qs = {}
+        # qlist = [0, 0.025, 0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.95, 0.975, 1]
+        # for qq in qlist:
+            # qs[str(qq)] = all_site_data[list(dg.var_name_map.fine)].quantile(qq)            
         
         # define larger pixels to merge when defining dates/sites to pull from        
         big_pixels = pd.DataFrame()
@@ -2111,7 +2337,7 @@ if __name__=="__main__":
         dg.site_metadata = dg.site_metadata.merge(big_pixels, on='parent_pixel_id', how='left')
         
         outdir = nz_train_path + '/var_quantile_samples/'
-                
+        
         for v in ['TA', 'PA', 'LWIN', 'WS', 'RH']:
             TT = (all_site_data[['DATE_TIME', 'SITE_ID', 'parent_pixel_id', v]]
                 .dropna()
@@ -2139,6 +2365,8 @@ if __name__=="__main__":
         TT_e0 = TT[TT[v] == 0]
         TT = TT[TT[v] > 0]
         
+        # cut down to manageable number of zeros
+        TT_e0 = TT_e0.sample(int(1e6), replace=False)
         pd.to_pickle(TT_e0[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{0}.pkl', compression={'method': 'gzip', 'compresslevel': 5})
         l1 = TT.shape[0] // 40
         l2 = TT.shape[0] // 20
@@ -2154,8 +2382,35 @@ if __name__=="__main__":
             pd.to_pickle(T_bin[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{i}.pkl',
                          compression={'method': 'gzip', 'compresslevel': 5})
             l0 += lls[i]
-                
-        for vv in ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']:
+            
+        v = 'PRECIP'
+        TT = (all_site_data[['DATE_TIME', 'SITE_ID', 'parent_pixel_id', v]]
+            .dropna()
+            .sort_values(v)
+            .reset_index(drop=True))
+        TT_e0 = TT[TT[v] == 0]
+        TT = TT[TT[v] > 0]
+        
+        # cut down to manageable number of zeros
+        TT_e0 = TT_e0.sample(int(1e6), replace=False)
+        pd.to_pickle(TT_e0[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{0}.pkl', compression={'method': 'gzip', 'compresslevel': 5})
+        # define uneven quantile bins to capture extreme events
+        l1 = TT.shape[0] // 40
+        l2 = TT.shape[0] // 20
+        l3 = TT.shape[0] // 10
+        l4 = 3 * (TT.shape[0] // 10)
+        lls = [0, l2, l2, l3, l4, l4, l3, l2, l1, l1]
+        l0 = 0
+        for i in range(1, 10):
+            if i<9:
+                T_bin = TT.iloc[l0:(l0+lls[i])]
+            else:
+                T_bin = TT.iloc[l0:]
+            pd.to_pickle(T_bin[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{i}.pkl',
+                         compression={'method': 'gzip', 'compresslevel': 5})
+            l0 += lls[i]
+        
+        for vv in ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']:
             for nbin in range(10):
                 dat = pd.read_pickle(outdir + f'/{vv}_bin_{nbin}.pkl',
                                      compression={'method': 'gzip', 'compresslevel': 5})

@@ -7,9 +7,9 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ExponentialLR
 from pathlib import Path
 
-from setupdata3 import data_generator
+from setupdata3 import data_generator, Batch
 from utils import frange_cycle_linear, setup_checkpoint
-from model2 import MetVAE, SimpleDownscaler
+from model2 import SimpleDownscaler
 from params import data_pars, model_pars, train_pars
 from loss_funcs2 import make_loss_func
 from step3 import fit
@@ -17,7 +17,7 @@ from step3 import fit
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 if __name__=="__main__":
-    var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']
+    var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
     try:
         parser = argparse.ArgumentParser()
         parser.add_argument("var_num", help = "variable to use")
@@ -40,13 +40,13 @@ if __name__=="__main__":
     reset_chkpnt = False
 
     ## create data generator
-    datgen = data_generator() # creation of this gives log value warning
+    datgen = data_generator()
+    if var=='PRECIP': datgen.load_EA_rain_gauge_data()
 
     ## dummy batch for model param fetching
     batch = datgen.get_batch(var,
                              batch_size=train_pars.batch_size,
                              batch_type='train',
-                             load_binary_batch=False,
                              p_hourly=1)
                                   
     ## create model
@@ -89,8 +89,8 @@ if __name__=="__main__":
                                      train_pars.cooldown_epochs), dtype=np.float32)
     
     penalise_zeros = False
-    if var=='SWIN':
-        penalise_zeros = True
+    #if var=='SWIN':
+    #    penalise_zeros = True
         
     loglikelihood = make_loss_func(train_pars,
                                    use_unseen_sites=train_pars.use_unseen_sites,
@@ -112,7 +112,6 @@ if __name__=="__main__":
                                     datgen,                                
                                     batch_prob_hourly,
                                     LR_scheduler=LR_scheduler,
-                                    null_batch_prob=train_pars.null_batch_prob,
                                     outdir=model_outdir,
                                     checkpoint=checkpoint,
                                     device=device)

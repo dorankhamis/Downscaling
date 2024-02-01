@@ -11,8 +11,10 @@ from sklearn.neighbors import NearestNeighbors
 import sklearn.metrics as metrics
 import torch.nn as nn
 
-from params import normalisation as nm
-from params import data_pars
+from downscaling.params import normalisation as nm
+from downscaling.params import data_pars, model_pars
+
+EPS = 1e-30
 
 def trim(tensor, scale):
     return tensor[:,:,scale:-scale,scale:-scale]
@@ -32,6 +34,8 @@ def unnormalise(dat, var, names):
         dat[[var]+names] = dat[[var]+names] * nm.lwin_sd + nm.lwin_mu
     if var=='WS':
         dat[[var]+names] = dat[[var]+names] * nm.ws_sd + nm.ws_mu
+        dat[['UX']+names] = dat[['UX']+names] * nm.ws_sd
+        dat[['VY']+names] = dat[['VY']+names] * nm.ws_sd
     if var=='RH':
         dat[[var]+names] = dat[[var]+names] * nm.rh_sd + nm.rh_mu
     if var=='DTR': # daily temp range
@@ -49,6 +53,8 @@ def unnormalise_img(dat, var):
         dat = dat * nm.lwin_sd + nm.lwin_mu
     if var=='WS':
         dat = dat * nm.ws_sd + nm.ws_mu
+    if var=='UX' or var=='VY':
+        dat = dat * nm.ws_sd
     if var=='RH':
         dat = dat * nm.rh_sd + nm.rh_mu
     if var=='DTR': # daily temp range
@@ -126,7 +132,7 @@ def off_grid_site_lat_lon(raw_site_lats, raw_site_lons,
     # get off-grid lat lon of sites
     lls = pd.concat([pd.Series(raw_site_lats) / nm.lat_norm, pd.Series(raw_site_lons) / nm.lon_norm], axis=1).values
     latlon_grid = np.stack([raw_grid_lats / nm.lat_norm, raw_grid_lons / nm.lon_norm], axis=0)
-    latlon_grid = np.reshape(latlon_grid, (2, raw_H*raw_W)).T #self.dim_h*self.dim_h    
+    latlon_grid = np.reshape(latlon_grid, (2, raw_H*raw_W)).T #self.dim_h*self.dim_h
     neigh = NearestNeighbors(n_neighbors=4)
     neigh.fit(latlon_grid)
     dists, inds = neigh.kneighbors(X=lls)    
@@ -144,9 +150,14 @@ def mask_to_softmask(distances, dist_lim, dist_lim_far=None, attn_eps=None,
         softmask[diminish_mask] = np.exp(- (distances[diminish_mask] - dist_lim)**2 / attn_sigmasq)
     elif diminish_model=="polynomial":
         softmask[diminish_mask] = 1. / (distances[diminish_mask] / dist_lim)**poly_exp
-    return softmask
+    # but we want to add to scores in exponentiated space (before the softmax),
+    # so take log, meaning the softmask when distance=0 is 0 (log(1)==0) 
+    # and it is negative for finite separation distances.
+    return np.log(softmask + EPS)
 
-def build_soft_masks(softmask, scale_factors, device):    
+def build_soft_masks(softmask, scale_factors, device,
+                     var=None, cntxt_stats=None,
+                     fine_inputs=None, fine_variable_order=None):    
     context_soft_masks = [softmask]
     for i, sf in enumerate(scale_factors):
         context_soft_masks.append(nn.functional.interpolate(
@@ -154,12 +165,43 @@ def build_soft_masks(softmask, scale_factors, device):
             scale_factor=sf,
             mode='bilinear')
         )
+    
+    # apply shade / cloud affect on high-resolution soft masking
+    if var=='SWIN' or var=='LWIN' or var=='PRECIP':
+        cloud_ind = fine_variable_order.index('cloud_cover')
+        if var=='SWIN':
+            shade_ind = fine_variable_order.index('shade_map')
+            illum_ind = fine_variable_order.index('illumination_map')
+    
+        for i in range(cntxt_stats.shape[0]):
+            if var=='SWIN':
+                solar_dist = (
+                    (fine_inputs[:,cloud_ind,:,:] - cntxt_stats.iloc[i].cloud_cover).square() + 
+                    (fine_inputs[:,shade_ind,:,:] - cntxt_stats.iloc[i].shade_map).square() + 
+                    (fine_inputs[:,illum_ind,:,:] - cntxt_stats.iloc[i].illumination_map).square()
+                ).sqrt()
+            else:
+                solar_dist = (fine_inputs[:,cloud_ind,:,:] - cntxt_stats.iloc[i].cloud_cover).abs()
+
+            context_soft_masks[-1][:,i,:,:] = context_soft_masks[-1][:,i,:,:] - 5.*solar_dist
+        
     context_soft_masks = [torch.transpose(
             torch.reshape(mm, (mm.shape[0], mm.shape[1], mm.shape[2]*mm.shape[3])), -2, -1
         )[None,...].to(device) for mm in context_soft_masks
     ]
     return context_soft_masks
-    
+
+def visualise_softmask_spatially(masks, level=0, b=0, site=0):
+    Y = masks['pixel_passers'][level][b].shape[1]
+    X = masks['pixel_passers'][level][b].shape[2]
+    plt.imshow(
+        masks['context_soft_masks'][level][b]
+            .reshape((1,Y,X,-1))
+            .detach().numpy()
+            [0,::-1,:,site]
+    )
+    plt.show()
+
 def build_pixel_passers(distances, scale_factors, dist_lim_pixpass, pass_exp, device):
     min_dists = distances.min(dim=1)[0]
     min_dists[min_dists < dist_lim_pixpass] = 1.
@@ -216,13 +258,25 @@ def prepare_attn(model, batch, site_meta, fine_grid,
             .loc[context_sites]
         )
     cntxt_stats = cntxt_stats.assign(s_idx = np.arange(cntxt_stats.shape[0]))
+    
+    # check if we have sites
+    if cntxt_stats.shape[0]==0:
+        return None, None, None, None, None
+    
+    if fine_grid is None:
+        fine_lats = batch.fine_inputs[b,-2,:,:].cpu().numpy() * nm.lat_norm
+        fine_lons = batch.fine_inputs[b,-1,:,:].cpu().numpy() * nm.lon_norm
+    else:
+        fine_lats = fine_grid.lat.isel(x=batch.batch_metadata[b]['x_inds'],
+                                       y=batch.batch_metadata[b]['y_inds']).values,
+        fine_lons = fine_grid.lon.isel(x=batch.batch_metadata[b]['x_inds'],
+                                       y=batch.batch_metadata[b]['y_inds']).values,
+    
     site_yx = off_grid_site_lat_lon(
         cntxt_stats.LATITUDE,
         cntxt_stats.LONGITUDE,
-        fine_grid.lat.isel(x=batch.batch_metadata[b]['x_inds'],
-                           y=batch.batch_metadata[b]['y_inds']).values,
-        fine_grid.lon.isel(x=batch.batch_metadata[b]['x_inds'],
-                           y=batch.batch_metadata[b]['y_inds']).values,
+        fine_lats,
+        fine_lons,
         X1, raw_H, raw_W
     )
 
@@ -249,11 +303,11 @@ def prepare_attn(model, batch, site_meta, fine_grid,
         diminish_model=diminish_model
     )
     
-    distances = torch.from_numpy(distances)[None,...].to(torch.float32)
-    softmask = torch.from_numpy(softmask)[None,...].to(torch.float32)
+    distances = torch.from_numpy(distances)[None,...].to(torch.float32).to(batch.coarse_inputs.device)
+    softmask = torch.from_numpy(softmask)[None,...].to(torch.float32).to(batch.coarse_inputs.device)
     
     scale_factors = [3 for i in range(model.nups)] + [raw_H / (3**model.nups * raw_H_c)]
-    return distances, softmask, scale_factors, site_yx
+    return distances, softmask, scale_factors, site_yx, cntxt_stats
     
 def subset_context_masks(batch, context_sites, context_masks, b=0):
     bsites = np.array(batch.raw_station_dict[b]['context'].index)
@@ -261,6 +315,111 @@ def subset_context_masks(batch, context_sites, context_masks, b=0):
     s_idxs = context_sites.loc[bsites].s_idx.values # s_idx already assigned
     batch_masks = [m[:,:,:,s_idxs] for m in context_masks]
     return batch_masks
+
+def create_attention_masks(model, batch, var,
+                           dist_lim = None,
+                           dist_lim_far = None,
+                           attn_eps = None,
+                           poly_exp = None,
+                           diminish_model = None,
+                           dist_pixpass = None,
+                           pass_exp = None):
+    '''
+    Output format is:
+        outer list of length n_resolutions
+        inner lists of length batch_size
+        containing tensors of pixels x pixels or pixels x context sites
+    '''
+    if dist_lim is None: 
+        dist_lim = model_pars.dist_lim
+    if dist_lim_far is None:
+        dist_lim_far = model_pars.dist_lim_far
+    if attn_eps is None:
+        attn_eps=model_pars.attn_eps
+    if poly_exp is None:
+        poly_exp = model_pars.poly_exp
+    if diminish_model is None:
+        diminish_model = model_pars.diminish_model
+    if dist_pixpass is None:
+        dist_pixpass = model_pars.dist_pixpass
+    if pass_exp is None:
+        pass_exp = model_pars.pass_exp
+    
+    attn_masks = {
+        'context_soft_masks':[None, None, None, None],
+        'pixel_passers':     [None, None, None, None],
+        'context_masks':     [None, None, None, None]
+    }
+    for b in range(len(batch.batch_metadata)):
+        site_meta = (pd.concat([batch.raw_station_dict[b]['context'],
+                                batch.raw_station_dict[b]['target']], axis=0)
+            .reset_index()
+        )
+        distances, softmask, scale_factors, site_yx, cntxt_stats = prepare_attn(
+            model,
+            batch,
+            site_meta,
+            None,
+            context_sites=None,
+            b=b,
+            dist_lim=dist_lim,
+            dist_lim_far=dist_lim_far,
+            attn_eps=attn_eps,
+            poly_exp=poly_exp,
+            diminish_model=diminish_model
+        )
+        
+        masks = {
+            'context_soft_masks':[None,None,None,None],
+            'pixel_passers':     [None,None,None,None],
+            'context_masks':     [None,None,None,None]
+        }
+        
+        # if no context stations just return
+        if not (distances is None):
+            if model_pars.soft_masks:
+                # do we want to allow attention head-dependent 
+                # scaling of the soft masks as per ALiBi
+                # https://arxiv.org/pdf/2108.12409.pdf
+                masks['context_soft_masks'] = build_soft_masks(
+                    softmask,
+                    scale_factors,
+                    batch.coarse_inputs.device,
+                    var=var,
+                    cntxt_stats=cntxt_stats,
+                    fine_inputs=batch.fine_inputs,
+                    fine_variable_order=batch.batch_metadata[b]['fine_var_order']
+                )
+            if model_pars.pixel_pass_masks:        
+                masks['pixel_passers'] = build_pixel_passers(
+                    distances,
+                    scale_factors,
+                    dist_pixpass,
+                    pass_exp,
+                    batch.coarse_inputs.device
+                )
+                # reshaping is done in the model...
+            if model_pars.binary_masks:
+                masks['context_masks'] = build_binary_masks(
+                    distances,
+                    scale_factors,
+                    dist_lim_far,
+                    batch.coarse_inputs.device
+                )            
+
+        for mtype in masks.keys():
+            for ll in range(len(masks[mtype])):
+                if b==0:
+                    if masks[mtype][ll] is None:
+                        attn_masks[mtype][ll] = [None]
+                    else:
+                        attn_masks[mtype][ll] = [masks[mtype][ll][0]]
+                else:
+                    if masks[mtype][ll] is None:
+                        attn_masks[mtype][ll].append(None)
+                    else:
+                        attn_masks[mtype][ll].append(masks[mtype][ll][0])
+    return attn_masks
 
 def pooling(mat, ksize, method='max', pad=False):
     # from https://stackoverflow.com/questions/42463172/how-to-perform-max-mean-pooling-on-a-2d-array-using-numpy

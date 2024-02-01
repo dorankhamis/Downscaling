@@ -49,7 +49,7 @@ def model_site_density_scatter(dat, var, modelname, year, timestep,
         pltdat = pltdat.loc[np.intersect1d(sites, pltdat.index.unique())]
     fig, ax = plt.subplots(1, figsize=(7,6))    
     ax = density_scatter(x=pltdat[var], y=pltdat[modelname],
-                         fig=fig, ax=ax, s=3.5, bins=30)        
+                         fig=fig, ax=ax, s=3.5, bins=30)
     xx = np.mean(ax.get_xlim())
     ax.axline((xx,xx), slope=1, linestyle='--', color='k')
     ax.set_title(f'{title_text}, {var} {year} {timestep}, model: {modelname}')
@@ -74,22 +74,43 @@ def model_compare_site_density_scatter(dat, var, modelnames, year, timestep,
     )
     if not sites is None:
         pltdat = pltdat.loc[np.intersect1d(sites, pltdat.index.unique())]
+        
     xx_lab = pltdat[var].values.flatten().min()
     yy_lab = pltdat[modelnames].values.flatten().max()
-    fig, ax = plt.subplots(1, len(modelnames), figsize=(6*len(modelnames),5),
-                           sharex=True, sharey=True)
-    for i in range(len(modelnames)):        
-        ax[i] = density_scatter(x=pltdat[var], y=pltdat[modelnames[i]],
-                                fig=fig, ax=ax[i], s=3., bins=30)
-        xx = np.mean(ax[i].get_xlim())
-        ax[i].axline((xx,xx), slope=1, linestyle='--', color='k')
-        ax[i].set_title(f'{title_text}, {var} {year} {timestep}, model: {modelnames[i]}')
-        # add metrics
-        mets = calc_metrics(pltdat, var, modelnames[i])
-        newlab = f'NSE = {np.around(mets["NSE"], 3)}  KGE = {np.around(mets["KGE"], 3)}  MAE = {np.around(mets["mae"], 3)}'
-        ax[i].text(xx_lab, yy_lab, newlab, fontsize = 10)
-        ax[i].set_xlabel('Observed')
-    ax[0].set_ylabel('Modelled')
+    
+    if len(modelnames)<4:
+        fig, ax = plt.subplots(1, len(modelnames), figsize=(6*len(modelnames),5),
+                               sharex=True, sharey=True)
+        for i in range(len(modelnames)):        
+            ax[i] = density_scatter(x=pltdat[var], y=pltdat[modelnames[i]],
+                                    fig=fig, ax=ax[i], s=3., bins=30)
+            xx = np.mean(ax[i].get_xlim())
+            ax[i].axline((xx,xx), slope=1, linestyle='--', color='k')
+            ax[i].set_title(f'{title_text}, {var} {year} {timestep}, model: {modelnames[i]}')
+            # add metrics
+            mets = calc_metrics(pltdat, var, modelnames[i])
+            newlab = f'NSE = {np.around(mets["NSE"], 3)}  KGE = {np.around(mets["KGE"], 3)}  MAE = {np.around(mets["mae"], 3)}'
+            ax[i].text(xx_lab, yy_lab, newlab, fontsize = 10)
+            ax[i].set_xlabel('Observed')
+        ax[0].set_ylabel('Modelled')
+    if len(modelnames)>=4:
+        ncols = int(np.ceil(np.sqrt(len(modelnames))))
+        nrows = int(np.ceil(len(modelnames) / ncols))
+        fig, ax = plt.subplots(nrows, ncols, figsize=(6*ncols-1, 5*nrows-1),
+                               sharex=True, sharey=True)
+        for i in range(len(modelnames)):        
+            ax[i//ncols, i%ncols] = density_scatter(x=pltdat[var], y=pltdat[modelnames[i]],
+                                    fig=fig, ax=ax[i//ncols, i%ncols], s=3., bins=30)
+            xx = np.mean(ax[i//ncols, i%ncols].get_xlim())
+            ax[i//ncols, i%ncols].axline((xx,xx), slope=1, linestyle='--', color='k')
+            ax[i//ncols, i%ncols].set_title(f'{title_text}, {var} {year} {timestep}, model: {modelnames[i]}')
+            # add metrics
+            mets = calc_metrics(pltdat, var, modelnames[i])
+            newlab = f'NSE = {np.around(mets["NSE"], 3)}  KGE = {np.around(mets["KGE"], 3)}  MAE = {np.around(mets["mae"], 3)}'
+            ax[i//ncols, i%ncols].text(xx_lab, yy_lab, newlab, fontsize = 10)            
+        for j in range(nrows): ax[j,0].set_ylabel('Modelled')
+        for j in range(ncols): ax[-1,j].set_xlabel('Observed')
+        
     if save:
         plt.savefig(pltdir + f'/{var}_{timestep}_scatter_{outname}.png', bbox_inches='tight')            
         plt.close()
@@ -386,7 +407,8 @@ def extract_site_predictions(preds, station_targets, batch, met_vars, model_name
                 df_out = pd.concat([df_out, compare.assign(site_type = site_type)], axis=0)
     return df_out
 
-def plot_station_locations(station_targets, fine_inputs, b, labels=True):
+def plot_station_locations(station_targets, fine_inputs, b, labels=True,
+                           plot_context=True, plot_target=True):
     # generalise this for any tile size!
     #dim_h = data_pars.dim_l * data_pars.scale
     #station_targets[b]['context']['adj_y'] = dim_h - station_targets[b]['context'].sub_y
@@ -396,19 +418,24 @@ def plot_station_locations(station_targets, fine_inputs, b, labels=True):
 
     fig, ax = plt.subplots()
     ax.imshow(to_np(fine_inputs)[b, 0, ::-1, :], alpha=0.6, cmap='Greys')
-    ax.scatter(station_targets[b]['context'].sub_x, station_targets[b]['context'].adj_y,
-               s=18, c='#1f77b4', marker='s')
-    ax.scatter(station_targets[b]['target'].sub_x, station_targets[b]['target'].adj_y,
-               s=18, c='#17becf', marker='o')
+    if plot_context:
+        ax.scatter(station_targets[b]['context'].sub_x, station_targets[b]['context'].adj_y,
+                   s=18, c='#1f77b4', marker='s')
+    if plot_target:
+        ax.scatter(station_targets[b]['target'].sub_x, station_targets[b]['target'].adj_y,
+                   s=18, c='#17becf', marker='o')
     if labels:
-        texts = [plt.text(station_targets[b]['context'].sub_x.iloc[i],
-                          station_targets[b]['context'].adj_y.iloc[i],
-                          station_targets[b]['context'].index[i], fontsize=9) 
-                            for i in range(station_targets[b]['context'].shape[0])]
-        texts += [plt.text(station_targets[b]['target'].sub_x.iloc[i],
-                           station_targets[b]['target'].adj_y.iloc[i],
-                           station_targets[b]['target'].index[i], fontsize=9) 
-                                for i in range(station_targets[b]['target'].shape[0])]
+        texts = []
+        if plot_context:
+            texts += [plt.text(station_targets[b]['context'].sub_x.iloc[i],
+                               station_targets[b]['context'].adj_y.iloc[i],
+                               station_targets[b]['context'].index[i], fontsize=9) 
+                                    for i in range(station_targets[b]['context'].shape[0])]
+        if plot_target:
+            texts += [plt.text(station_targets[b]['target'].sub_x.iloc[i],
+                               station_targets[b]['target'].adj_y.iloc[i],
+                               station_targets[b]['target'].index[i], fontsize=9) 
+                                    for i in range(station_targets[b]['target'].shape[0])]
         adjust_text(texts, arrowprops=dict(arrowstyle="-", color='k', lw=0.5))
     plt.axis('off')
     plt.show()

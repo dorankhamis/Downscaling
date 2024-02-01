@@ -136,16 +136,16 @@ if __name__=="__main__":
             context_frac = 1
             
             # attn params
-            dist_lim = 80 # mean==80 but could load var specific vals?
-            dist_lim_far = dist_lim + 50
-            dist_pixpass = 100
-            attn_eps = 1e-6
-            poly_exp = 4.
-            diminish_model = "gaussian" # ["gaussian", "polynomial"]
-            pass_exp = 1.
-            soft_masks = True
-            pixel_pass_masks = True
-            binary_masks = False
+            # dist_lim = 80 # mean==80 but could load var specific vals?
+            # dist_lim_far = dist_lim + 50
+            # dist_pixpass = 100
+            # attn_eps = 1e-6
+            # poly_exp = 4.
+            # diminish_model = "gaussian" # ["gaussian", "polynomial"]
+            # pass_exp = 1.
+            # soft_masks = True
+            # pixel_pass_masks = True
+            # binary_masks = False
             
             daily_results = pd.DataFrame()
             hourly_results = pd.DataFrame()
@@ -183,11 +183,11 @@ if __name__=="__main__":
                     datgen.fine_grid,
                     context_sites=None,
                     b=ii,
-                    dist_lim=dist_lim,
-                    dist_lim_far=dist_lim_far,
-                    attn_eps=attn_eps,
-                    poly_exp=poly_exp,
-                    diminish_model=diminish_model
+                    dist_lim=model_pars.dist_lim,
+                    dist_lim_far=model_pars.dist_lim_far,
+                    attn_eps=model_pars.attn_eps,
+                    poly_exp=model_pars.poly_exp,
+                    diminish_model=model_pars.diminish_model
                 )
                 
                 masks = {
@@ -195,13 +195,28 @@ if __name__=="__main__":
                     'pixel_passers':     [None,None,None,None],
                     'context_masks':     [None,None,None,None]
                 }
-                if soft_masks:
-                    masks['context_soft_masks'] = build_soft_masks(softmask, scale_factors, device)
-                if pixel_pass_masks:        
-                    masks['pixel_passers'] = build_pixel_passers(distances, scale_factors, dist_pixpass, pass_exp, device)
+                if model_pars.soft_masks:
+                    masks['context_soft_masks'] = build_soft_masks(
+                        softmask,
+                        scale_factors,
+                        device
+                    )
+                if model_pars.pixel_pass_masks:        
+                    masks['pixel_passers'] = build_pixel_passers(
+                        distances,
+                        scale_factors,
+                        model_pars.dist_pixpass,
+                        model_pars.pass_exp,
+                        device
+                    )
                     # reshaping is done in the model...
-                if binary_masks:
-                    masks['context_masks'] = build_binary_masks(distances, scale_factors, dist_lim_far, device)
+                if model_pars.binary_masks:
+                    masks['context_masks'] = build_binary_masks(
+                        distances,
+                        scale_factors,
+                        model_pars.dist_lim_far,
+                        device
+                    )
                 
                 with torch.no_grad():
                     out = model(batch.coarse_inputs[ii:iinext,...],
@@ -215,41 +230,7 @@ if __name__=="__main__":
                                  batch2.fine_inputs[ii:iinext,...],
                                  batch2.context_data[ii:iinext],
                                  batch2.context_locs[ii:iinext])                
-  
-                # iinext = min(ii+max_batch_size, batch.coarse_inputs.shape[0])
-                # # because we throttle at batch size of 1, we don't need to 
-                # # worry about padding attention masks / context data
-                
-                # # actually subset distances / softmasks and create masks anew here
-                # # batch_elem_masks = subset_context_masks(batch,
-                                                        # # cntxt_stats,
-                                                        # # masks['context_soft_masks'],
-                                                        # # b=ii)
-                # bsites = np.array(batch.raw_station_dict[ii]['context'].index)                
-                # s_idxs = context_sites.loc[bsites].s_idx.values
-                # sub_dists = distances[:,s_idxs,:,:] # approx
-                # sub_softmasks = softmask[:,s_idxs,:,:] # approx
-                # masks = {}
-                # if soft_masks:
-                    # masks['context_soft_masks'] = build_soft_masks(sub_softmasks, scale_factors, device)
-                # if pixel_pass_masks:        
-                    # masks['pixel_passers'] = build_pixel_passers(sub_dists, scale_factors, dist_lim_far, pass_exp, device)
-                    # # reshaping is done in the model...
-                # if binary_masks:
-                    # masks['context_masks'] = build_binary_masks(sub_dists, scale_factors, dist_lim_far, device)
-                                                        
-                
-                # with torch.no_grad():
-                    # out = model(batch.coarse_inputs[ii:iinext,...],
-                                # batch.fine_inputs[ii:iinext,...],
-                                # batch.context_data[ii:iinext],
-                                # batch.context_locs[ii:iinext],
-                                # context_soft_masks=masks['context_soft_masks'],
-                                # pixel_passer=masks['pixel_passers'])                                
-                    # out2 = model(batch2.coarse_inputs[ii:iinext,...],
-                                # batch2.fine_inputs[ii:iinext,...],
-                                # batch2.context_data[ii:iinext],
-                                # batch2.context_locs[ii:iinext])    
+
                 pred.append(out.cpu())
                 pred2.append(out2.cpu())
                 del(out)

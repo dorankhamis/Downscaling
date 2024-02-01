@@ -4,11 +4,11 @@ import torch.nn as nn
 import torch
 
 from params import data_pars as dps
+from params import normalisation as nm
 from utils import trim
 
 sqrt2pi = torch.sqrt(torch.tensor(torch.pi * 2))
 EPS = 1e-10
-sigma_growth = np.sqrt(np.linspace(10., 1., 24))
 
 def normal_loglikelihood(x, mu, sigma):
     sig = torch.tensor(sigma).to(x.device)
@@ -23,8 +23,6 @@ def loglik_of_station_pixels(pred, station_dict, station_num_obs, sigma=0.01, pe
             mask = station_dict['var_present'][b][i,:] # variable mask
             vals_true = station_dict['values'][b][i,:][mask]
             vals_pred = pred[b,:,yx[i,0],yx[i,1]][mask]
-            #s_mult = sigma_growth[station_num_obs[b][i]-1]
-            #station_loglik += normal_loglikelihood(vals_pred, vals_true, sigma*s_mult).sum()
             station_loglik += normal_loglikelihood(vals_pred, vals_true, sigma).sum()
             
             if penalise_zeros:
@@ -34,7 +32,7 @@ def loglik_of_station_pixels(pred, station_dict, station_num_obs, sigma=0.01, pe
             
             n_elements += mask.sum()
     if n_elements==0:
-        return station_loglik
+        return station_loglik # zeros
     else:
         return station_loglik / n_elements.to(torch.float32)
 
@@ -46,8 +44,8 @@ def physical_constraints(pred, constraints, sea_mask=None, sigma=0.1):
     for i in range(constraints.shape[1]):
         mask = torch.isfinite(constraints[:,i,:,:][sea_mask])
         loglik_var = normal_loglikelihood(pred[:,i,:,:][sea_mask][mask],
-                                         constraints[:,i,:,:][sea_mask][mask],
-                                         sigma)
+                                          constraints[:,i,:,:][sea_mask][mask],
+                                          sigma)
         constraint_loglik += loglik_var.sum() / loglik_var.shape[0]
         
     return constraint_loglik
@@ -63,6 +61,7 @@ def preserve_coarse_grid_average(pred, coarse_inputs, sea_mask=None, sigma=0.1):
                                 coarse_inputs[sea_mask], sigma).mean()
 
 def enforce_local_continuity(pred, sigma=0.01):
+    ## unused
     EX_2 = torch.square(nn.functional.avg_pool2d(pred, 4, stride=1))
     E_X2 = nn.functional.avg_pool2d(torch.square(pred), 4, stride=1)
     local_std = torch.sqrt(E_X2 - EX_2)
@@ -96,7 +95,25 @@ def make_loss_func(train_pars, use_unseen_sites=True, penalise_zeros=False):
                 target_station_pixel_L = torch.zeros((), dtype=torch.float32).to(pred.device)
         
         # sea mask for not counting sea pixels
-        sea_mask = trim(batch.fine_inputs, dps.scale)[:,0:1,:,:] # landfrac channel
+        #sea_mask = trim(batch.fine_inputs, dps.scale)[:,0:1,:,:] # landfrac channel
+        
+        # ireland and shetland mask instead, to leave a bit of sea around
+        # the land for better averaging?
+        lat_up = 55.3
+        lat_down = 51.0
+        lon_right = -5.4
+        lon_left = -8.3
+        lat_shet = 59.5
+        ireland_shetland_mask = ~torch.bitwise_or(
+            torch.bitwise_and(
+                torch.bitwise_and(batch.fine_inputs[:,-2:-1,:,:]<(lat_up/nm.lat_norm),
+                                  batch.fine_inputs[:,-2:-1,:,:]>(lat_down/nm.lat_norm)),
+                torch.bitwise_and(batch.fine_inputs[:,-1:,:,:]<(lon_right/nm.lon_norm),
+                                  batch.fine_inputs[:,-1:,:,:]>(lon_left/nm.lon_norm))
+            ), batch.fine_inputs[:,-2:-1,:,:]>(lat_shet/nm.lat_norm)
+        )
+        sea_mask = trim(ireland_shetland_mask, dps.scale)
+        
         phys_constraints_L = physical_constraints(
             trim(pred, dps.scale),
             trim(batch.constraint_targets, dps.scale),
@@ -105,7 +122,7 @@ def make_loss_func(train_pars, use_unseen_sites=True, penalise_zeros=False):
         )
         
         # coarsen sea mask and threshold        
-        sea_mask = nn.functional.avg_pool2d(sea_mask, dps.scale, stride=dps.scale)
+        sea_mask = nn.functional.avg_pool2d(sea_mask.to(torch.float32), dps.scale, stride=dps.scale)
         sea_mask = sea_mask > 0.5
         grid_avg_L = preserve_coarse_grid_average(
             trim(pred, dps.scale),

@@ -107,9 +107,19 @@ def create_null_batch(batch, constraints=True):
     
     zero_locs = [torch.zeros((1, batch.context_locs[0].shape[1], 0)) for b in range(batch.coarse_inputs.shape[0])]
     zero_data = [torch.zeros((1, batch.context_data[0].shape[1], 0)) for b in range(batch.coarse_inputs.shape[0])]
+    zero_c_numobs = [None for b in range(len(batch.context_num_obs))]
+    zero_t_numobs = [None for b in range(len(batch.target_num_obs))]
+    zero_c_station_dict = {k:None for k in batch.context_station_dict}
+    zero_t_station_dict = {k:None for k in batch.target_station_dict}
+    zero_raw_station_df = [{'context':None, 'target':None} for i in range(len(batch.raw_station_dict))]
     
     batch2.context_locs = zero_locs
-    batch2.context_data = zero_data    
+    batch2.context_data = zero_data
+    batch2.context_num_obs = zero_c_numobs
+    batch2.target_num_obs = zero_t_numobs
+    batch2.context_station_dict = zero_c_station_dict
+    batch2.target_station_dict = zero_t_station_dict
+    batch2.raw_station_dict = zero_raw_station_df    
     return batch2
 
 def read_qbin(var, nbin, batch_type='train'):

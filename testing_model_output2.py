@@ -11,7 +11,7 @@ from sklearn.metrics import r2_score
 
 from setupdata3 import (data_generator, Batch, create_chess_pred,
                         load_process_chess, interp_to_grid, reflect_pad_nans)
-from model2 import MetVAE, SimpleDownscaler
+from model2 import SimpleDownscaler
 from params import data_pars, model_pars, train_pars
 from loss_funcs2 import make_loss_func
 from step3 import create_null_batch
@@ -26,7 +26,7 @@ datgen = data_generator()
 
 # file paths
 #var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
-var = 'PRECIP'
+var = 'TA'
 log_dir = './logs/'
 model_name = f'dwnsamp_{var}'
 model_outdir = f'{log_dir}/{model_name}/'
@@ -123,8 +123,19 @@ for var in var_names:
                                         model_outdir, log_dir,
                                         specify_chkpnt=specify_chkpnt,
                                         reset_chkpnt=reset_chkpnt)
-
     model.eval()
+
+
+    '''
+    Somehow the pred2 results for the null batch CHANGED 
+    when we altered the masking parameters.
+    This should be impossible!
+    Investigate this!!!!
+    
+    And now even the context-aware value ISN'T changing when 
+    altering the masking parameters?? CHECK ALL OF THIS
+    before training more!
+    '''
 
 
     # get tile(s) of whole UK
@@ -144,13 +155,13 @@ for var in var_names:
 
     batch = Batch(batch, var_list=var, device=device, constraints=constraints)
     masks = create_attention_masks(model, batch, var,
-                                   dist_lim = None,
-                                   dist_lim_far = None,
+                                   dist_lim = 90,
+                                   dist_lim_far = 110,
                                    attn_eps = None,
-                                   poly_exp = None,
+                                   poly_exp = 2.,
                                    diminish_model = None,
-                                   dist_pixpass = None,
-                                   pass_exp = None)
+                                   dist_pixpass = 125,
+                                   pass_exp = 2)
     
     station_targets = batch.raw_station_dict
     sample_metadata = batch.batch_metadata
@@ -217,11 +228,12 @@ for var in var_names:
         # fig.colorbar(im, ax=ax.ravel().tolist())
         # plt.show()
 
-
     if PLOT:
         b = 0
         plot_batch_tiles(batch, pred, fine_vars, met_vars, b=b,
                          sea_mask=None, trim_edges=False, constraints=constraints)
+
+
 
     # run again but zero all the context inputs to see what happens without them
     batch2 = create_null_batch(batch)
@@ -229,7 +241,8 @@ for var in var_names:
         pred2 = model(batch2.coarse_inputs, batch2.fine_inputs,
                       batch2.context_data, batch2.context_locs)
         pred2 = pred2.cpu().numpy()
-    if var=='SWIN': pred2 = pred2.clip(min=0)
+    if (var=='SWIN') or (var=='PRECIP'): pred2 = pred2.clip(min=0)
+
 
     if PLOT:
         era5 = batch.coarse_inputs.cpu().numpy()
@@ -266,17 +279,23 @@ for var in var_names:
         (calc_metrics(site_res['target']
             .pivot(columns='variable', index='SITE_ID', values='value'),
              var, 'this_model_nc')
-         )
+        )
         (calc_metrics(site_res['target']
             .pivot(columns='variable', index='SITE_ID', values='value'),
              var, 'this_model')
-         )
+        )
         
-        calc_metrics(site_res['context'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model_nc')
-        calc_metrics(site_res['context'].pivot(columns='variable', index='SITE_ID', values='value'), var, 'this_model')
+        (calc_metrics(site_res['context']
+            .pivot(columns='variable', index='SITE_ID', values='value'),
+            var, 'this_model_nc')
+        )
+        (calc_metrics(site_res['context']
+            .pivot(columns='variable', index='SITE_ID', values='value'),
+            var, 'this_model')
+        )
 
         plot_station_locations(batch.raw_station_dict, batch.fine_inputs, b,
-                               plot_target=False, labels=False)
+                               plot_target=True, labels=False)
 
 
 # diminish_mask = distances > model_pars.dist_lim

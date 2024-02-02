@@ -8,19 +8,33 @@ from inspect import isfunction
     
 from utils import find_num_pools, decide_scale_factor
 
-## some code from https://github.com/Janspiry/Palette-Image-to-Image-Diffusion-Models/blob/main/models/sr3_modules/unet.py
-
 def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])  
-        
-def exists(x):
-    return x is not None
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
+def attention(query, key, value, mask=None, softmask=None, dropout=None):
+    "Compute 'Scaled Dot Product Attention'"
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) \
+             / math.sqrt(d_k)
+    
+    if softmask is not None:        
+        scores = scores + softmask # log already taken in mask creation
+    elif mask is not None:        
+        scores = scores.masked_fill(mask == 0, -1e9)
+    
+    p_attn = F.softmax(scores, dim = -1)
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    return torch.matmul(p_attn, value), p_attn
+
+def get_emb(sin_inp):
+    """
+    Gets a base embedding for one dimension with sin and cos intertwined
+    """
+    emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
+    return torch.flatten(emb, -2, -1)
+
 
 class LayerNorm(nn.Module):
     "Construct a layernorm module."
@@ -35,6 +49,7 @@ class LayerNorm(nn.Module):
         std = x.std(-1, keepdim=True)
         return self.a_2.to(x.device) * (x - mean) / (std + self.eps) + self.b_2.to(x.device)
 
+
 class SublayerConnection(nn.Module):
     """
     A residual connection followed by a layer norm.
@@ -48,6 +63,7 @@ class SublayerConnection(nn.Module):
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
         return x + self.dropout(sublayer(self.norm(x)))
+
 
 class GridPointAttn(nn.Module):
     def __init__(self, d_input, d_cross_attn, context_channels,
@@ -108,161 +124,59 @@ class GridPointAttn(nn.Module):
         # process outputs
         return torch.stack(attn_out, dim=0)
 
-
-class CoarsenField(nn.Module):
-    def __init__(self, hires_fields, filters, outsize,
-                 scale=25, simple=False, pool='max'):
-        super(CoarsenField, self).__init__()
-        " filters are used sequentially from the zeroth element "
-        self.scale = scale
-        n = find_num_pools(scale, max_num=5, factor=3)
-        self.npools = min(n, len(filters))      
-        if pool=='max':
-            self.nn_pool = nn.MaxPool2d(3)
-        else:
-            self.nn_pool = nn.AvgPool2d(3)
+    
+class Attention1D(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        "Take in model size and number of heads."
+        super(Attention1D, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)        
+        
+    def forward(self, query, key, value,
+                mask=None, softmask=None, pixel_passer=None):
+        # Same mask applied to all h heads...
+        # unless we use the ALibi reducing m_factor
+        if softmask is not None:
+            # if not ALibi just unsqueeze the head dimension:
+            #softmask = softmask.unsqueeze(1)
             
-        coarsen_list = []
-        for i in range(self.npools):
-            if i==0:
-                if simple:
-                    coarsen_list.append(nn.Sequential(
-                        nn.Conv2d(hires_fields, filters[i], kernel_size=3,
-                                  stride=1, padding="same"),
-                        nn.ReLU(),                        
-                        self.nn_pool)
-                    )
-
-                else:
-                    coarsen_list.append(nn.Sequential(
-                        nn.Conv2d(hires_fields, filters[i], kernel_size=3,
-                                  stride=1, padding="same"),
-                        nn.ReLU(),                    
-                        nn.Conv2d(filters[i], filters[i], kernel_size=3,
-                                  stride=1, padding="same"),
-                        self.nn_pool)
-                    )
-            else:
-                if simple:
-                    coarsen_list.append(nn.Sequential(
-                        nn.Conv2d(filters[i-1], filters[i], kernel_size=3,
-                                  stride=1, padding="same"),
-                        nn.ReLU(),                        
-                        self.nn_pool)
-                    )                    
-                else:                    
-                    coarsen_list.append(nn.Sequential(
-                        nn.Conv2d(filters[i-1], filters[i], kernel_size=3,
-                                  stride=1, padding="same"),
-                        nn.ReLU(),
-                        nn.Conv2d(filters[i], filters[i], kernel_size=3,
-                                  stride=1, padding="same"),
-                        self.nn_pool)
-                    )
-        self.pool = nn.ModuleList(coarsen_list)
-        
-        if self.npools==0:
-            self.embed = nn.Conv2d(hires_fields, filters[0], kernel_size=3,
-                                   stride=1, padding="same")
-        
-        last_filt = min(max(1,self.npools), len(filters)-1)
-        self.pre_interp_conv = nn.Conv2d(filters[max(0, self.npools-1)],
-                                         filters[last_filt], kernel_size=1,
-                                         stride=1, padding="same")
-        self.post_interp_conv = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(filters[last_filt], outsize,
-                      kernel_size=3, stride=1, padding=0)
-        )        
-        
-    def forward(self, fine_inputs):
-        # coarsening using pooling
-        x = fine_inputs        
-        if self.npools>0:            
-            for i in range(len(self.pool)):
-                x = self.pool[i](x)
-        else:            
-            x = self.embed(x)
+            # if ALibi, multiply each head by decreasng m_factor:
+            sizes = list(softmask.shape)
+            sizes.insert(1, self.h)
+            use_softmask = torch.zeros(tuple(sizes), dtype=torch.float32).to(softmask.device)
+            m_factors = [1/2**n for n in range(self.h)]
+            for hh in range(self.h):
+                use_softmask[:,hh,...] = use_softmask[:,hh,...] * m_factors[hh]
+            softmask = use_softmask
+        elif mask is not None:            
+            mask = mask.unsqueeze(1)
             
-        # final correction
-        x = self.pre_interp_conv(x)
-        scale_factor = decide_scale_factor(fine_inputs.shape[-2:], x.shape[-2:], self.scale)
-        x = nn.functional.interpolate(x, scale_factor=scale_factor, mode='bilinear')
-        x = self.post_interp_conv(x)        
-        return x
-
-class RefineField(nn.Module):
-    def __init__(self, lores_fields, filters, outsize, scale=25, scale_factor=2):
-        super(RefineField, self).__init__()        
-        " filters are used sequentially from the zeroth element "
-        self.scale = scale
-        self.scale_factor = scale_factor
-        n = find_num_pools(scale, max_num=5, factor=self.scale_factor)        
-        self.nups = min(n, len(filters))
-        self.upsample = nn.Upsample(scale_factor=self.scale_factor, mode='bilinear') 
+        nbatches = query.size(0)
         
-        pre_refine_list = []
-        post_refine_list = []        
-        for i in range(self.nups):
-            if i==0:
-                pre_refine_list.append(
-                    nn.Conv2d(lores_fields, filters[i], kernel_size=3, # kernel_size=1?
-                              stride=1, padding="same")
-                )
-            else:
-                pre_refine_list.append(
-                    nn.Conv2d(filters[i-1], filters[i], kernel_size=3, # kernel_size=1?
-                              stride=1, padding="same")                    
-                )
-            post_refine_list.append(nn.Sequential(
-                    nn.ReflectionPad2d(1),
-                    nn.Conv2d(filters[i], filters[i],
-                              kernel_size=3, stride=1, padding=0),
-                    nn.ReLU()
-                )
-            )
-        self.pre_ups = nn.ModuleList(pre_refine_list)
-        self.post_ups = nn.ModuleList(post_refine_list)
+        # do all the linear projections in batch from d_model => h x d_k 
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+             for l, x in zip(self.linears, (query, key, value))]
         
-        if self.nups==0:
-            self.embed = nn.Conv2d(lores_fields, filters[0], kernel_size=3, # kernel_size=1?
-                                   stride=1, padding="same")
+        # apply attention on all the projected vectors in batch 
+        x, self.attn = attention(query, key, value,
+                                 mask=mask, 
+                                 dropout=self.dropout,
+                                 softmask=softmask)
         
-        last_filt = min(max(1, self.nups), len(filters)-1)
-        self.pre_interp_conv = nn.Conv2d(filters[max(0,self.nups-1)],
-                                         filters[last_filt], kernel_size=3,  # kernel_size=1?
-                                         stride=1, padding="same")
-        self.post_interp_conv = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(filters[last_filt], outsize,
-                      kernel_size=3, stride=1, padding=0)            
-        )
-        
-    def forward(self, coarse_input):
-        # refining using interpolation
-        x = coarse_input
-        if self.nups>0:
-            for i in range(len(self.pre_ups)):
-                x = self.pre_ups[i](x) # prepare for upsampling                
-                x = self.upsample(x)
-                x = self.post_ups[i](x) # post-process upsampling
+        # "concat" using a view and apply a final linear
+        x = x.transpose(1, 2).contiguous() \
+             .view(nbatches, -1, self.h * self.d_k)
+             
+        if pixel_passer is not None:
+            return self.linears[-1](x) * torch.reshape(pixel_passer, (pixel_passer.shape[0], pixel_passer.shape[1]*pixel_passer.shape[2])).unsqueeze(-1)
         else:
-            x = self.embed(x) 
-        
-        # final correction
-        x = self.pre_interp_conv(x)
-        scale_factor = self.scale / (self.scale_factor**self.nups)
-        x = nn.functional.interpolate(x, scale_factor=scale_factor, mode='bilinear')
-        x = self.post_interp_conv(x)
-        return x
-
-
-def get_emb(sin_inp):
-    """
-    Gets a base embedding for one dimension with sin and cos intertwined
-    """
-    emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
-    return torch.flatten(emb, -2, -1)
+            return self.linears[-1](x)
 
     
 class PositionalEncoding2D(nn.Module):
@@ -336,40 +250,6 @@ class PositionalEncodingOffGrid(nn.Module):
         return torch.diagonal(emb[:,:,:self.org_channels], dim1=0, dim2=1)
 
 
-class Swish(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(x)
-
-
-class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=32, dropout=0):
-        super(Block, self).__init__()
-        self.block = nn.Sequential(
-            nn.GroupNorm(groups, dim),
-            Swish(),
-            nn.Dropout(dropout) if dropout != 0 else nn.Identity(),
-            nn.Conv2d(dim, dim_out, 3, padding=1)
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, dropout=0, norm_groups=32):
-        super(ResnetBlock, self).__init__()        
-        self.block1 = Block(dim, dim_out, groups=norm_groups)
-        self.block2 = Block(dim_out, dim_out, groups=norm_groups, dropout=dropout)
-        self.res_conv = nn.Conv2d(
-            dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        h = self.block1(x)        
-        h = self.block2(h)
-        return h + self.res_conv(x)
-
-
 class SelfAttention2D(nn.Module):
     def __init__(self, in_channel, n_head=1, norm_groups=32):
         super(SelfAttention2D, self).__init__()
@@ -405,93 +285,3 @@ class SelfAttention2D(nn.Module):
         return out + input
 
 
-class ResnetBlocWithAttn(nn.Module):
-    def __init__(self, dim, dim_out, *, norm_groups=32, dropout=0, with_attn=False):
-        super(ResnetBlocWithAttn, self).__init__()
-        self.with_attn = with_attn        
-        self.res_block = ResnetBlock(
-            dim, dim_out, norm_groups=norm_groups, dropout=dropout)
-        if with_attn:
-            self.pe = PositionalEncoding2D(dim_out)
-            self.attn = SelfAttention2D(dim_out, norm_groups=norm_groups)
-            #self.sublayer = SublayerConnection(dim, dropout)
-
-    def forward(self, x, mask=None):
-        x = self.res_block(x)
-        if(self.with_attn):        
-            # (B, C, Y, X) -> (B, Y, X, C) -> PE -> (B, C, Y, X)
-            x = self.pe(x.permute(0,2,3,1)).permute(0,3,1,2)
-            x = self.attn(x, mask=mask)
-        return x
-
-def attention(query, key, value, mask=None, softmask=None, dropout=None):
-    "Compute 'Scaled Dot Product Attention'"
-    d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) \
-             / math.sqrt(d_k)
-    
-    if softmask is not None:
-        #if scores.max() > 70:
-        #    print('potential exp overflow in attn score softmasking')        
-        #scores = torch.log(torch.exp(scores) * softmask)
-        scores = scores + softmask # log already taken in mask creation
-    elif mask is not None:        
-        scores = scores.masked_fill(mask == 0, -1e9)
-    
-    p_attn = F.softmax(scores, dim = -1)
-    if dropout is not None:
-        p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
-    
-class Attention1D(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
-        "Take in model size and number of heads."
-        super(Attention1D, self).__init__()
-        assert d_model % h == 0
-        # We assume d_v always equals d_k
-        self.d_k = d_model // h
-        self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.attn = None
-        self.dropout = nn.Dropout(p=dropout)        
-        
-    def forward(self, query, key, value,
-                mask=None, softmask=None, pixel_passer=None):
-        # Same mask applied to all h heads...
-        # unless we use the ALibi reducing m_factor
-        if softmask is not None:
-            # if not ALibi just unsqueeze the head dimension:
-            #softmask = softmask.unsqueeze(1)
-            
-            # if ALibi, multiply each head by decreasng m_factor:
-            sizes = list(softmask.shape)
-            sizes.insert(1, self.h)
-            use_softmask = torch.zeros(tuple(sizes), dtype=torch.float32).to(softmask.device)
-            m_factors = [1/2**n for n in range(self.h)]
-            for hh in range(self.h):
-                use_softmask[:,hh,...] = use_softmask[:,hh,...] * m_factors[hh]
-            softmask = use_softmask
-        elif mask is not None:            
-            mask = mask.unsqueeze(1)
-            
-        nbatches = query.size(0)
-        
-        # 1) Do all the linear projections in batch from d_model => h x d_k 
-        query, key, value = \
-            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-             for l, x in zip(self.linears, (query, key, value))]
-        
-        # 2) Apply attention on all the projected vectors in batch. 
-        x, self.attn = attention(query, key, value,
-                                 mask=mask, 
-                                 dropout=self.dropout,
-                                 softmask=softmask)
-        
-        # 3) "Concat" using a view and apply a final linear. 
-        x = x.transpose(1, 2).contiguous() \
-             .view(nbatches, -1, self.h * self.d_k)
-             
-        if pixel_passer is not None:
-            return self.linears[-1](x) * torch.reshape(pixel_passer, (pixel_passer.shape[0], pixel_passer.shape[1]*pixel_passer.shape[2])).unsqueeze(-1)
-        else:
-            return self.linears[-1](x)

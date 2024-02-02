@@ -134,19 +134,7 @@ if __name__=="__main__":
             p_hourly = 1
             max_batch_size = 1        
             context_frac = 1
-            
-            # attn params
-            # dist_lim = 80 # mean==80 but could load var specific vals?
-            # dist_lim_far = dist_lim + 50
-            # dist_pixpass = 100
-            # attn_eps = 1e-6
-            # poly_exp = 4.
-            # diminish_model = "gaussian" # ["gaussian", "polynomial"]
-            # pass_exp = 1.
-            # soft_masks = True
-            # pixel_pass_masks = True
-            # binary_masks = False
-            
+ 
             daily_results = pd.DataFrame()
             hourly_results = pd.DataFrame()
             if var=='TA': dtr_daily_results = pd.DataFrame()
@@ -155,8 +143,7 @@ if __name__=="__main__":
             date_string = f'{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}'
             
             batch = datgen.get_all_space(var,
-                                         batch_type='train',
-                                         load_binary_batch=False,
+                                         batch_type='train',                                         
                                          context_frac=context_frac,
                                          date_string=date_string,
                                          it=it,
@@ -169,6 +156,8 @@ if __name__=="__main__":
             
             batch = Batch(batch, var_list=var, device=device, constraints=False)
             batch2 = create_null_batch(batch, constraints=False)
+            masks = create_attention_masks(model, batch, var) 
+            
             ii = 0
             pred = []
             pred2 = []
@@ -176,56 +165,18 @@ if __name__=="__main__":
             while ii<batch.coarse_inputs.shape[0]:
                 iinext = min(ii+max_batch_size, batch.coarse_inputs.shape[0])
 
-                distances, softmask, scale_factors, site_yx = prepare_attn(
-                    model,
-                    batch,
-                    datgen.site_metadata,
-                    datgen.fine_grid,
-                    context_sites=None,
-                    b=ii,
-                    dist_lim=model_pars.dist_lim,
-                    dist_lim_far=model_pars.dist_lim_far,
-                    attn_eps=model_pars.attn_eps,
-                    poly_exp=model_pars.poly_exp,
-                    diminish_model=model_pars.diminish_model
-                )
-                
-                masks = {
-                    'context_soft_masks':[None,None,None,None],
-                    'pixel_passers':     [None,None,None,None],
-                    'context_masks':     [None,None,None,None]
-                }
-                if model_pars.soft_masks:
-                    masks['context_soft_masks'] = build_soft_masks(
-                        softmask,
-                        scale_factors,
-                        device
-                    )
-                if model_pars.pixel_pass_masks:        
-                    masks['pixel_passers'] = build_pixel_passers(
-                        distances,
-                        scale_factors,
-                        model_pars.dist_pixpass,
-                        model_pars.pass_exp,
-                        device
-                    )
-                    # reshaping is done in the model...
-                if model_pars.binary_masks:
-                    masks['context_masks'] = build_binary_masks(
-                        distances,
-                        scale_factors,
-                        model_pars.dist_lim_far,
-                        device
-                    )
+                context_masks = [[masks['context_masks'][r][ii]] for r in range(len(masks['context_masks']))]
+                context_soft_masks = [[masks['context_soft_masks'][r][ii]] for r in range(len(masks['context_soft_masks']))]
+                pixel_passer = [[masks['pixel_passers'][r][ii]] for r in range(len(masks['pixel_passers']))]
                 
                 with torch.no_grad():
                     out = model(batch.coarse_inputs[ii:iinext,...],
                                 batch.fine_inputs[ii:iinext,...],
                                 batch.context_data[ii:iinext],
                                 batch.context_locs[ii:iinext],
-                                context_masks=masks['context_masks'],
-                                context_soft_masks=masks['context_soft_masks'],
-                                pixel_passer=masks['pixel_passers'])    
+                                context_masks=context_masks,
+                                context_soft_masks=context_soft_masks,
+                                pixel_passer=pixel_passer)    
                     out2 = model(batch2.coarse_inputs[ii:iinext,...],
                                  batch2.fine_inputs[ii:iinext,...],
                                  batch2.context_data[ii:iinext],

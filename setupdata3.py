@@ -1261,6 +1261,8 @@ class data_generator():
                 (self.site_metadata['SITE_ID'].isin(self.train_sites + self.heldout_sites)) &
                 (self.site_metadata['parent_pixel_id'].isin(parents))
             ]
+        elif batch_type=='run':
+            contained_sites = self.site_metadata.copy()
         
         # find location of contained sites in local subset and pull out data
         contained_sites = contained_sites.set_index('SITE_ID')
@@ -1340,13 +1342,6 @@ class data_generator():
         )
         
         # create value/density pairs (+ altitude) vector for context points
-        '''
-        For Wind Components model, where we propose to predict 
-        both components in one model, we need to alter this 
-        so we can add both component values to the context data set.
-        This would also need an altered loss function that is aware 
-        of this!
-        '''
         if var[0]=='WS':
             self.context_variable_order = ['var_value_u', 'var_value_v', 'elev', 'lat', 'lon']
         else:
@@ -2138,7 +2133,7 @@ class data_generator():
                 'batch_metadata':batch_metadata
                 }    
 
-    def get_all_space(self, var, batch_type='train',
+    def get_all_space(self, var, batch_type='run',
                       context_frac=None, date_string=None, it=None,
                       timestep='hourly', tile=False, min_overlap=1,
                       return_constraints=False):

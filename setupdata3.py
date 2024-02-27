@@ -329,8 +329,7 @@ def calculate_illumination_map(sp, grid, height_grid):
 
 def partition_interp_solar_radiation(swin_coarse, fine_grid, sp,
                                      press_coarse, press_fine,
-                                     height_grid, shading_array,
-                                     sea_shading_array,
+                                     height_grid, shade_map,
                                      scale, sky_view_factor):
     # A Physically Based Atmospheric Variables Downscaling Technique,
     # TASNUVA ROUF et al. (2019)
@@ -379,9 +378,9 @@ def partition_interp_solar_radiation(swin_coarse, fine_grid, sp,
         cos_solar_illum = calculate_illumination_map(sp, fine_grid, height_grid)
 
         # add shade map        
-        shade_map = (fine_grid.landfrac.copy()).astype(np.float32)        
-        shade_map.values[fine_grid.landfrac.values>0] = -(shading_array-1) # invert shade to zero
-        shade_map.values[fine_grid.landfrac.values==0] = -(sea_shading_array-1) # invert shade to zero
+        # shade_map = (fine_grid.landfrac.copy()).astype(np.float32)        
+        # shade_map.values[fine_grid.landfrac.values>0] = -(shading_array-1) # invert shade to zero
+        # shade_map.values[fine_grid.landfrac.values==0] = -(sea_shading_array-1) # invert shade to zero
         
         # broadband attenuation
         press_coarse.load()
@@ -609,14 +608,8 @@ class data_generator():
         self.lcm_names = ['l_wooded', 'l_open', 'l_mountain-heath', 'l_urban']        
         
         # load sky view factor map
-        svfs = np.load(nz_base + '/downscaling/training_data/sky_view_factor.npy')
-        sea_svfs = np.load(nz_base + '/downscaling/training_data/sea_sky_view_factor.npy')
-        self.skyview_map = (self.fine_grid.landfrac.copy()).astype(np.float32)
-        self.skyview_map.values[:,:] = 1
-        self.skyview_map.values[self.fine_grid.landfrac.values==1] = svfs.clip(min=0, max=1)
-        self.skyview_map.values[self.fine_grid.landfrac.values==0] = sea_svfs.clip(min=0, max=1)
-        del(svfs)
-        del(sea_svfs)
+        self.skyview_map = xr.load_dataset(nz_train_path + '/sky_view_factor.nc')
+        self.skyview_map = self.skyview_map.sky_view_factor     
     
         # define ERA5 (coarse) and COSMOS (fine) variables to load
         var_name_map = dict(
@@ -629,11 +622,11 @@ class data_generator():
                       'PRECIP', 'UX', 'VY']
         )        
         self.var_name_map = pd.DataFrame(var_name_map)
-        # self.var_name_map = self.var_name_map.assign(
-            # chess = np.array(['tas', 'psurf', 'rsds', 'rlds',
-                              # 'sfcWind', 'huss', 'precip'])
-            # # huss is originally specific humidity but we transform it to RH
-        # )
+        self.var_name_map = self.var_name_map.assign(
+            chess = np.array(['tas', 'psurf', 'rsds', 'rlds',
+                              'sfcWind', 'huss', 'precip', 'NA', 'NA'])
+            # huss is originally specific humidity but we transform it to RH
+        )
         self.var_name_map.index = self.var_name_map.fine
         
         # define model inputs for each variable
@@ -767,7 +760,6 @@ class data_generator():
         self.train_sites = train_sites
         self.heldout_sites = heldout_sites
         
-        
         if load_site_data:
             # normalise site data
             for SID in list(self.site_data.keys()):
@@ -801,10 +793,10 @@ class data_generator():
 
             # resample site data to daily and note number of data points present
             self.site_points_present = {}
-            #self.daily_site_data = {}
+            self.daily_site_data = {}
             for SID in list(self.site_data.keys()):
                 self.site_points_present[SID] = self.site_data[SID].groupby(pd.Grouper(freq='D')).count()
-                #self.daily_site_data[SID] = self.site_data[SID].resample('1D').mean()
+                self.daily_site_data[SID] = self.site_data[SID].resample('1D').mean()
         
         # indices in a dim_h x dim_h grid
         X1 = np.where(np.ones((self.dim_h, self.dim_h)))
@@ -1049,9 +1041,10 @@ class data_generator():
                 self.sp.calc_solar_angles(self.fine_grid.lat, self.fine_grid.lon)
             if 'SWIN' in var:
                 self.solar_illum_map = calculate_illumination_map(self.sp, self.fine_grid, self.height_grid)
-                self.shade_map = self.fine_grid.lat.copy()                
-                self.shade_map.values[self.fine_grid.landfrac.values>0] = -(self.shading_array[it,:] - 1)
-                self.shade_map.values[self.fine_grid.landfrac.values==0] = -(self.sea_shading_array[it,:] - 1)
+                #self.shade_map = self.fine_grid.lat.copy()                
+                #self.shade_map.values[self.fine_grid.landfrac.values>0] = -(self.shading_array[it,:] - 1)
+                #self.shade_map.values[self.fine_grid.landfrac.values==0] = -(self.sea_shading_array[it,:] - 1)                
+                self.shade_map = self.shading_ds.isel(time=it)
         
         # subset hi-res fields to the chosen coarse tile
         x_inds = np.intersect1d(np.where(self.fine_grid.x.values < int(subdat.x.max().values) + self.res//2),
@@ -1455,8 +1448,7 @@ class data_generator():
                 self.parent_pixels['hourly'][self.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu, # de-nornmalise!
                 self.p_1km_elev[it,:,:],
                 self.height_grid,
-                self.shading_array[it,:],
-                self.sea_shading_array[it,:],
+                self.shading_ds.isel(time=it),                
                 self.scale,
                 self.skyview_map
             )
@@ -1830,14 +1822,16 @@ class data_generator():
                 # this requires particular units - do before changing them!
                 self.prepare_constraints(var)
         
-        ## load other large grids that we only wan to load once per batch
+        ## load other large grids that we only want to load once per batch
         if 'SWIN' in var:
             # terrain shading used in hourly AND daily
             doy = self.td.day_of_year - 1 # zero indexed
-            self.shading_array = np.load(
-                nz_train_path + f'/terrain_shading/shading_mask_day_{doy}_merged_to_7999.npy')
-            self.sea_shading_array = np.load(
-                nz_train_path + f'/terrain_shading/sea_shading_mask_day_{doy}_merged_to_7999.npy')
+            # self.shading_array = np.load(
+                # nz_train_path + f'/terrain_shading/shading_mask_day_{doy}_merged_to_7999.npy')
+            # self.sea_shading_array = np.load(
+                # nz_train_path + f'/terrain_shading/sea_shading_mask_day_{doy}_merged_to_7999.npy')
+            self.shading_ds = xr.open_dataset(nz_train_path + f'./terrain_shading/shading_mask_{doy}.nc')
+            self.shading_ds = self.shading_ds.shading
                 
         if ('SWIN' in var) or ('LWIN' in var) or ('PRECIP' in var) :
             # cloud cover
@@ -2009,10 +2003,11 @@ class data_generator():
             if 'SWIN' in var:
                 # we don't want a smoothed illumination map, though...
                 self.sol_ilum.values /= self.sun_hrs.values
-                self.av_shade_map.values[self.fine_grid.landfrac.values==1] = \
-                    -(np.mean(self.shading_array[sun_hours,:], axis=0) - 1)
-                self.av_shade_map.values[self.fine_grid.landfrac.values==0] = \
-                    -(np.mean(self.sea_shading_array[sun_hours,:], axis=0) - 1)
+                # self.av_shade_map.values[self.fine_grid.landfrac.values==1] = \
+                    # -(np.mean(self.shading_array[sun_hours,:], axis=0) - 1)
+                # self.av_shade_map.values[self.fine_grid.landfrac.values==0] = \
+                    # -(np.mean(self.sea_shading_array[sun_hours,:], axis=0) - 1)
+                self.av_shade_map.values = self.shading_array.isel(time=sun_hours).mean(dim='time').values
         else:
             pass
     
@@ -2133,6 +2128,100 @@ class data_generator():
                 'batch_metadata':batch_metadata
                 }    
 
+    def get_prefetch_data(self, var, batch_type='train',                          
+                          date=None, times=[]):
+        ''' 
+        when using date, parent_pixel_ids, times to select batches,
+        date must be a datetime.date object
+        parent_pixel_ids must be list of integers
+        times must be a list of integers in {0,23}
+        '''
+        if not date is None: date_string = f'{date.year}{zeropad_strint(date.month)}{zeropad_strint(date.day)}'
+        if times is None: times = []
+        if type(times)==int: times = [times]        
+        if type(var)==str: var = [var]
+        
+        self.parent_pixels = {}
+        self.parent_pixels['hourly'] = self.read_parent_pixel_day(batch_type=batch_type,
+                                                                  date_string=date_string)
+        self.td = pd.to_datetime(self.parent_pixels['hourly'].time[0].values, utc=True)        
+        batch_tsteps = 'hourly'
+
+        ## process and normalise ERA5 parent_pixels
+        self.prepare_era5_pixels(var, batch_tsteps=batch_tsteps)
+        
+        ## get additional fine scale met vars for input
+        self.prepare_fine_met_inputs(var, batch_tsteps)
+        
+        met_fine_path = nz_train_path + '/met_fine_prefetch/'
+        constraints_path = nz_train_path + '/constraints_prefetch/'
+        Path(met_fine_path).mkdir(exist_ok=True, parents=True)
+        Path(constraints_path).mkdir(exist_ok=True, parents=True)
+        
+        # output self.met_fine if it exists
+        
+        ## get full-map constraints
+        for it in times:
+            if 'TA' in var:
+                c = self.t_1km_elev.isel(time=it)
+                c.values = (c.values - 273.15 - nm.temp_mu) / nm.temp_sd
+                c.name = var[0]
+                c.to_netcdf(constraints_path + f'/{var[0]}_constraint_{date_string}_{it}.nc',
+                            encoding = {var[0]: {"zlib": True, "complevel": 9, "dtype": "float32"}})
+            if 'PA' in var:
+                c = self.p_1km_elev.isel(time=it)
+                c.values = (c.values - nm.p_mu) / nm.p_sd
+                constraint['PA'] = c.values.copy()
+            if 'SWIN' in var:
+                ## Shortwave radiation, time of day dependent
+                self.Sw_1km = partition_interp_solar_radiation(
+                    self.parent_pixels['hourly'][self.var_name_map.loc['SWIN'].coarse][it,:,:] * nm.swin_norm, # de-nornmalise!
+                    self.fine_grid,
+                    self.sp,
+                    self.parent_pixels['hourly'][self.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu, # de-nornmalise!
+                    self.p_1km_elev[it,:,:],
+                    self.height_grid,
+                    self.shading_ds.isel(time=it),                
+                    self.scale,
+                    self.skyview_map
+                )
+                self.Sw_1km = self.Sw_1km.clip(min=0) # get rid of negative swin
+                
+                c = self.Sw_1km
+                c.values = c.values / nm.swin_norm
+                constraint['SWIN'] = c.values.copy()
+            if 'LWIN' in var:
+                c = self.Lw_1km.isel(time=it)
+                c.values = (c.values - nm.lwin_mu) / nm.lwin_sd
+                constraint['LWIN'] = c.values.copy()
+            if 'WS' in var:            
+                c_x = self.ux_1km_interp.isel(time=it)
+                c_x.values = c_x.values / nm.ws_sd
+                c_y = self.vy_1km_interp.isel(time=it)
+                c_y.values = c_y.values / nm.ws_sd
+                constraint['UX'] = c_x.values.copy()
+                constraint['VY'] = c_y.values.copy()
+            if 'RH' in var:
+                c = self.rh_1km_interp.isel(time=it)
+                c.values = (c.values - nm.rh_mu) / nm.rh_sd
+                constraint['RH'] = c.values.copy()
+            if 'PRECIP' in var:
+                ## LOAD CEH-GEAR data for the date/time, or do this prior
+                ## to share dataset between same-day timepoints            
+                fine_sub = self.fine_grid
+                c = (self.gear.isel(time=it)
+                    .rainfall_amount
+                )
+                # infill sea NaNs with ERA5 precip interp, might need to transform precip interp to mm
+                sea_mask = np.isnan(c.values)
+                c.values[sea_mask] = (self.precip_1km_interp
+                    .isel(time=it)
+                    .values[sea_mask]
+                ) * 3600 # kg m2 s-1 to mm
+                c.values = c.values / nm.precip_norm
+                c = c.clip(min=0) # get rid of negative rain
+                constraint['PRECIP'] = c.values.copy()        
+        
     def get_all_space(self, var, batch_type='run',
                       context_frac=None, date_string=None, it=None,
                       timestep='hourly', tile=False, min_overlap=1,

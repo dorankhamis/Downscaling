@@ -42,19 +42,13 @@ if __name__=="__main__":
     ## create data generator
     datgen = data_generator()
     if var=='PRECIP': datgen.load_EA_rain_gauge_data()
-
-    ## dummy batch for model param fetching
-    batch = datgen.get_batch(var,
-                             batch_size=train_pars.batch_size,
-                             batch_type='train',
-                             p_hourly=1)
                                   
     ## create model
     model = SimpleDownscaler(
-        input_channels=batch['coarse_inputs'].shape[1],
-        hires_fields=batch['fine_inputs'].shape[1],
-        output_channels=batch['coarse_inputs'].shape[1],
-        context_channels=batch['station_data'][0].shape[1],
+        input_channels=model_pars.in_channels[var],
+        hires_fields=model_pars.hires_fields[var],
+        output_channels=model_pars.output_channels[var],
+        context_channels=model_pars.context_channels[var],
         filters=model_pars.filters,
         dropout_rate=model_pars.dropout_rate,
         scale=data_pars.scale,
@@ -64,8 +58,7 @@ if __name__=="__main__":
         pe=model_pars.pe
     )
 
-    model.to(device)
-    del(batch)
+    model.to(device)   
 
     ## create optimizer, schedulers and loss function
     optimizer = Adam(model.parameters(), lr=train_pars.lr)
@@ -88,13 +81,11 @@ if __name__=="__main__":
                                      train_pars.increase_epochs + 
                                      train_pars.cooldown_epochs), dtype=np.float32)
     
-    penalise_zeros = False
-    #if var=='SWIN':
-    #    penalise_zeros = True
-        
+    penalise_zeros = True if var=='PRECIP' else False
     loglikelihood = make_loss_func(train_pars,
                                    use_unseen_sites=train_pars.use_unseen_sites,
-                                   penalise_zeros=penalise_zeros)
+                                   penalise_zeros=penalise_zeros,
+                                   var=var)
 
     ## load checkpoint
     model, optimizer, checkpoint = setup_checkpoint(

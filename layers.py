@@ -142,17 +142,18 @@ class Attention1D(nn.Module):
         # Same mask applied to all h heads...
         # unless we use the ALibi reducing m_factor
         if softmask is not None:
-            # if not ALibi just unsqueeze the head dimension:
-            #softmask = softmask.unsqueeze(1)
+            ## if not ALibi just unsqueeze the head dimension:
+            softmask = softmask.unsqueeze(1)
             
-            # if ALibi, multiply each head by decreasng m_factor:
-            sizes = list(softmask.shape)
-            sizes.insert(1, self.h)
-            use_softmask = torch.zeros(tuple(sizes), dtype=torch.float32).to(softmask.device)
-            m_factors = [1/2**n for n in range(self.h)]
-            for hh in range(self.h):
-                use_softmask[:,hh,...] = use_softmask[:,hh,...] * m_factors[hh]
-            softmask = use_softmask
+            ## if ALibi, multiply each head by decreasng m_factor:
+            # sizes = list(softmask.shape)
+            # sizes.insert(1, self.h)
+            # use_softmask = torch.zeros(tuple(sizes), dtype=torch.float32).to(softmask.device)
+            # m_factors = [1/2**n for n in range(self.h)]
+            # for hh in range(self.h):
+                # use_softmask[:,hh,...] = softmask[:,hh,...] * m_factors[hh]
+            # softmask = use_softmask
+            
         elif mask is not None:            
             mask = mask.unsqueeze(1)
             

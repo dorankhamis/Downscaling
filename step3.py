@@ -11,20 +11,29 @@ from params import data_pars as dps, train_pars, model_pars as mps
 
 batch_quantiles_path = '/gws/nopw/j04/ceh_generic/netzero/downscaling/training_data/var_quantile_samples/'
 
-def model_step(model, batch, loglikelihood, var=None):
-    # prepare attention masks
-    masks = create_attention_masks(model, batch, var)
+def model_step(model, batch, loglikelihood, var=None, use_masks=False):
+    if use_masks:
+        # prepare attention masks
+        masks = create_attention_masks(model, batch, var)
     
     # run data through model
-    pred = model(
-        batch.coarse_inputs,
-        batch.fine_inputs,
-        batch.context_data,
-        batch.context_locs,
-        context_masks=masks['context_masks'],
-        context_soft_masks=masks['context_soft_masks'],
-        pixel_passer=masks['pixel_passers']
-    )
+    if use_masks:
+        pred = model(
+            batch.coarse_inputs,
+            batch.fine_inputs,
+            batch.context_data,
+            batch.context_locs,
+            context_masks=masks['context_masks'],
+            context_soft_masks=masks['context_soft_masks'],
+            pixel_passers=masks['pixel_passers']
+        )
+    else:
+        pred = model(
+            batch.coarse_inputs,
+            batch.fine_inputs,
+            batch.context_data,
+            batch.context_locs
+        )        
     
     # run data through model with no context sites
     batch2 = create_null_batch(batch)
@@ -45,7 +54,7 @@ def model_step(model, batch, loglikelihood, var=None):
     # calculate log likelihood, trimming edge pixels at coarse scale
     loss_dict = loglikelihood(pred, batch, null_stations=False)
     loss_dict_null = loglikelihood(pred2, batch, null_stations=True)
-    loglik = 0.6 * sum(loss_dict.values()) + 0.4 * sum(loss_dict_null.values())
+    loglik = 0.9 * sum(loss_dict.values()) + 0.1 * sum(loss_dict_null.values())
     
     # add vars to loss dict and return
     loss_dict['nll'] = -loglik

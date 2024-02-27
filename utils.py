@@ -4,7 +4,6 @@ import torch
 import shutil
 import warnings
 import datetime
-import faiss
 
 from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
@@ -142,7 +141,7 @@ def off_grid_site_lat_lon(raw_site_lats, raw_site_lons,
     return site_yx
 
 def mask_to_softmask(distances, dist_lim, dist_lim_far=None, attn_eps=None,
-                     poly_exp=None, diminish_model="gaussian"):    
+                     poly_exp=None, diminish_model="polynomial"):    
     diminish_mask = distances > dist_lim
     softmask = np.ones(distances.shape, dtype=np.float32)
     if diminish_model=="gaussian":
@@ -157,8 +156,9 @@ def mask_to_softmask(distances, dist_lim, dist_lim_far=None, attn_eps=None,
 
 def build_soft_masks(softmask, scale_factors, device,
                      var=None, cntxt_stats=None,
-                     fine_inputs=None, fine_variable_order=None):    
-    context_soft_masks = [softmask]
+                     fine_inputs=None, fine_variable_order=None):
+    if type(var)==list: var=var[0]
+    context_soft_masks = [torch.clone(softmask)]
     for i, sf in enumerate(scale_factors):
         context_soft_masks.append(nn.functional.interpolate(
             context_soft_masks[i],
@@ -182,25 +182,25 @@ def build_soft_masks(softmask, scale_factors, device,
                 ).sqrt()
             else:
                 solar_dist = (fine_inputs[:,cloud_ind,:,:] - cntxt_stats.iloc[i].cloud_cover).abs()
-
+            
             context_soft_masks[-1][:,i,:,:] = context_soft_masks[-1][:,i,:,:] - 5.*solar_dist
-        
+            
+            # interpolate for lower res masks
+            solar_dists_sf = []
+            for j in range(2, len(scale_factors)+2):
+                context_soft_masks[-j][:,i:(i+1),:,:] = (context_soft_masks[-j][:,i:(i+1),:,:] -
+                    5 * nn.functional.interpolate(
+                        solar_dist[None,...],
+                        size=context_soft_masks[-j][0,i,:,:].shape,
+                        mode='bilinear'
+                    )
+                )
+
     context_soft_masks = [torch.transpose(
             torch.reshape(mm, (mm.shape[0], mm.shape[1], mm.shape[2]*mm.shape[3])), -2, -1
         )[None,...].to(device) for mm in context_soft_masks
     ]
     return context_soft_masks
-
-def visualise_softmask_spatially(masks, level=0, b=0, site=0):
-    Y = masks['pixel_passers'][level][b].shape[1]
-    X = masks['pixel_passers'][level][b].shape[2]
-    plt.imshow(
-        masks['context_soft_masks'][level][b]
-            .reshape((1,Y,X,-1))
-            .detach().numpy()
-            [0,::-1,:,site]
-    )
-    plt.show()
 
 def build_pixel_passers(distances, scale_factors, dist_lim_pixpass, pass_exp, device):
     min_dists = distances.min(dim=1)[0]
@@ -237,7 +237,7 @@ def prepare_attn(model, batch, site_meta, fine_grid,
                  context_sites=None, b=0,
                  dist_lim=80, dist_lim_far=130,
                  attn_eps=1e-6, poly_exp=4,
-                 diminish_model="gaussian"):
+                 diminish_model="polynomial"):
     # create the flat YX grid for attention
     raw_H = batch.fine_inputs.shape[-2]
     raw_W = batch.fine_inputs.shape[-1]
@@ -330,20 +330,21 @@ def create_attention_masks(model, batch, var,
         inner lists of length batch_size
         containing tensors of pixels x pixels or pixels x context sites
     '''
+    if type(var)==str: var = [var]    
     if dist_lim is None: 
-        dist_lim = model_pars.dist_lim
+        dist_lim = model_pars.dist_lim[var[0]]
     if dist_lim_far is None:
         dist_lim_far = model_pars.dist_lim_far
     if attn_eps is None:
         attn_eps=model_pars.attn_eps
     if poly_exp is None:
-        poly_exp = model_pars.poly_exp
+        poly_exp = model_pars.poly_exp[var[0]]
     if diminish_model is None:
         diminish_model = model_pars.diminish_model
     if dist_pixpass is None:
-        dist_pixpass = model_pars.dist_pixpass
+        dist_pixpass = model_pars.dist_pixpass[var[0]]
     if pass_exp is None:
-        pass_exp = model_pars.pass_exp
+        pass_exp = model_pars.pass_exp[var[0]]
     
     attn_masks = {
         'context_soft_masks':[None, None, None, None],

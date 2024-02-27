@@ -21,12 +21,20 @@ from plotting import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+''' 
+
+Train without attention masks?
+Output constraints for the training set to speed up training?
+
+'''
+
 ## create data generator
 datgen = data_generator()
 
 # file paths
 #var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
-var = 'TA'
+var = 'SWIN'
 log_dir = './logs/'
 model_name = f'dwnsamp_{var}'
 model_outdir = f'{log_dir}/{model_name}/'
@@ -35,19 +43,15 @@ Path(model_outdir).mkdir(parents=True, exist_ok=True)
 # training flags
 load_prev_chkpnt = True
 # specify_chkpnt: if None, load best, otherwise "modelname/checkpoint.pth"
-#specify_chkpnt = None # f'{model_name}/checkpoint.pth' 
 specify_chkpnt = f'{model_name}/checkpoint.pth'
 reset_chkpnt = False
 
-## dummy batch for model param fetching
-batch = datgen.get_batch(var, batch_size=train_pars.batch_size, batch_type='train')
-
 ## create model              
 model = SimpleDownscaler(
-    input_channels=batch['coarse_inputs'].shape[1],
-    hires_fields=batch['fine_inputs'].shape[1],
-    output_channels=batch['coarse_inputs'].shape[1],
-    context_channels=batch['station_data'][0].shape[1],
+    input_channels=model_pars.in_channels[var],
+    hires_fields=model_pars.hires_fields[var],
+    output_channels=model_pars.output_channels[var],
+    context_channels=model_pars.context_channels[var],
     filters=model_pars.filters,
     dropout_rate=model_pars.dropout_rate,
     scale=data_pars.scale,
@@ -57,11 +61,9 @@ model = SimpleDownscaler(
     pe=model_pars.pe
  )
 
-del(batch)
 model.to(device)
 
-## create optimizer, schedulers and loss function
-## create optimizer, schedulers and loss function
+## create loss function
 loglikelihood = make_loss_func(train_pars)
 
 ## load checkpoint
@@ -76,6 +78,21 @@ plt.show()
 
 model.eval()
 
+####################
+var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
+for var in var_names:
+    ## dummy batch for model param fetching
+    batch = datgen.get_batch(var, batch_size=1,
+                             batch_type='train')
+    print(var)
+    print(f'input_channels = {batch["coarse_inputs"].shape[1]}')
+    print(f'hires_fields = {batch["fine_inputs"].shape[1]}')
+    print(f'output_channels = {batch["coarse_inputs"].shape[1]}')
+    print(f'context_channels = {batch["station_data"][0].shape[1]}')
+    print(f'coarse variable order = {batch["batch_metadata"][0]["coarse_var_order"]}')
+    print(f'fine variable order = {batch["batch_metadata"][0]["fine_var_order"]}')
+    print(f'context variable order = {batch["batch_metadata"][0]["context_var_order"]}')
+    
 
 ###################################
 ## UK plots for all vars
@@ -120,30 +137,17 @@ for var in var_names:
 
     ## load checkpoint
     model, opt, chk = setup_checkpoint(model, None, device, load_prev_chkpnt,
-                                        model_outdir, log_dir,
-                                        specify_chkpnt=specify_chkpnt,
-                                        reset_chkpnt=reset_chkpnt)
+                                       model_outdir, log_dir,
+                                       specify_chkpnt=specify_chkpnt,
+                                       reset_chkpnt=reset_chkpnt)
     model.eval()
-
-
-    '''
-    Somehow the pred2 results for the null batch CHANGED 
-    when we altered the masking parameters.
-    This should be impossible!
-    Investigate this!!!!
-    
-    And now even the context-aware value ISN'T changing when 
-    altering the masking parameters?? CHECK ALL OF THIS
-    before training more!
-    '''
-
 
     # get tile(s) of whole UK
     date_string = "20140101"
-    it = 9
+    it = 10
     tile = False
     context_frac = 0.7
-    constraints = False
+    constraints = True
     batch = datgen.get_all_space(var, batch_type='train',
                                  context_frac=context_frac,
                                  date_string=date_string, it=it,
@@ -154,15 +158,29 @@ for var in var_names:
     iys = batch['iys']
 
     batch = Batch(batch, var_list=var, device=device, constraints=constraints)
-    masks = create_attention_masks(model, batch, var,
-                                   dist_lim = 90,
-                                   dist_lim_far = 110,
-                                   attn_eps = None,
-                                   poly_exp = 2.,
-                                   diminish_model = None,
-                                   dist_pixpass = 125,
-                                   pass_exp = 2)
     
+    masks = create_attention_masks(model, batch, var,
+                                   dist_lim = None,
+                                   dist_lim_far = None,
+                                   attn_eps = None,
+                                   poly_exp = None,
+                                   diminish_model = None,
+                                   dist_pixpass = None,
+                                   pass_exp = None)
+    
+    if False:
+        just_dist_masks = create_attention_masks(model, batch, "TA",
+                                       dist_lim = None,
+                                       dist_lim_far = None,
+                                       attn_eps = None,
+                                       poly_exp = None,
+                                       diminish_model = None,
+                                       dist_pixpass = None,
+                                       pass_exp = None)
+                                       
+    # visualise_softmask_spatially(masks, level=0, b=0, site=0, exp=True)
+    # visualise_pixelpasser(masks, level=0, b=0)
+
     station_targets = batch.raw_station_dict
     sample_metadata = batch.batch_metadata
     met_vars = datgen.coarse_variable_order
@@ -173,19 +191,48 @@ for var in var_names:
                      batch.context_data, batch.context_locs,
                      context_masks=masks['context_masks'],
                      context_soft_masks=masks['context_soft_masks'],
-                     pixel_passer=masks['pixel_passers'])
+                     pixel_passers=masks['pixel_passers'])
         pred = pred.cpu().numpy()
     if (var=='SWIN') or (var=='PRECIP'): pred = pred.clip(min=0)
+    
+    if False:
+        with torch.no_grad():
+            pred_jd = model(batch.coarse_inputs, batch.fine_inputs,
+                         batch.context_data, batch.context_locs,
+                         context_masks=just_dist_masks['context_masks'],
+                         context_soft_masks=just_dist_masks['context_soft_masks'],
+                         pixel_passers=just_dist_masks['pixel_passers'])
+            pred_jd = pred_jd.cpu().numpy()
+        if (var=='SWIN') or (var=='PRECIP'): pred_jd = pred_jd.clip(min=0)
+        era5 = batch.coarse_inputs.cpu().numpy()
+        era5_unnorm = unnormalise_img(era5, var)
+        pred_unnorm = unnormalise_img(pred, var)
+        pred_jd_unnorm = unnormalise_img(pred_jd, var)
 
+        cmap = cm.get_cmap('plasma')
+        norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
+        im = cm.ScalarMappable(cmap=cmap, norm=norm)        
+        fig, ax = plt.subplots(1,3)
+        ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        ax[2].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        ax[1].imshow(pred_jd_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+        ax[0].set_title(f'ERA5 {var}')
+        ax[2].set_title(f'Downscaled {var}, intelligent masking')
+        ax[1].set_title(f'Downscaled {var}, distance masking')
+        fig.colorbar(im, ax=ax.ravel().tolist())
+        plt.show()
+        
+    
     #np.save(output_dir + f'coarse_inputs_{var}_{date_string}_{it}.npy', batch.coarse_inputs.cpu().numpy())
     #np.save(output_dir + f'prediction_{var}_{date_string}_{it}.npy', pred)
+
 
     if PLOT:
         era5 = batch.coarse_inputs.cpu().numpy()
         if var=='WS':
             #era5_ws_unnorm = unnormalise_img(datgen.parent_pixels['hourly'].isel(time=it).ws.values, 'WS')
             era5_unnorm = unnormalise_img(era5, 'UX')
-            pred_unnorm = unnormalise_img(pred, 'UX')            
+            pred_unnorm = unnormalise_img(pred, 'UX')
         else:
             era5_unnorm = unnormalise_img(era5, var)
             pred_unnorm = unnormalise_img(pred, var)
@@ -212,28 +259,27 @@ for var in var_names:
         fig.colorbar(im, ax=ax.ravel().tolist())
         plt.show()
         
+        if constraints:
+            constraint_unnorm = unnormalise_img(batch.constraint_targets.detach().numpy(), var)
+
+            fig, ax = plt.subplots(1,3)
+            cmap = cm.get_cmap('plasma')
+            norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
+            im = cm.ScalarMappable(cmap=cmap, norm=norm)
+            ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[1].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[2].imshow(constraint_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[0].set_title(f'ERA5 {var}')
+            ax[1].set_title(f'Downscaled {var}')
+            ax[2].set_title(f'Hi-res constraint {var}')
+            fig.colorbar(im, ax=ax.ravel().tolist())
+            plt.show()
         
-        # constraint_unnorm = unnormalise_img(batch.constraint_targets.detach().numpy(), var)
-
-        # fig, ax = plt.subplots(1,3)
-        # cmap = cm.get_cmap('plasma')
-        # norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
-        # im = cm.ScalarMappable(cmap=cmap, norm=norm)
-        # ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
-        # ax[1].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
-        # ax[2].imshow(constraint_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
-        # ax[0].set_title(f'ERA5 {var}')
-        # ax[1].set_title(f'Downscaled {var}')
-        # ax[2].set_title(f'Hi-res constraint {var}')
-        # fig.colorbar(im, ax=ax.ravel().tolist())
-        # plt.show()
-
-    if PLOT:
-        b = 0
-        plot_batch_tiles(batch, pred, fine_vars, met_vars, b=b,
+        plot_batch_tiles(batch, pred, fine_vars, met_vars, b=0,
                          sea_mask=None, trim_edges=False, constraints=constraints)
-
-
+        '''
+        cloud cover attention might be causing unnatural peaks in SWIN
+        '''
 
     # run again but zero all the context inputs to see what happens without them
     batch2 = create_null_batch(batch)
@@ -243,27 +289,49 @@ for var in var_names:
         pred2 = pred2.cpu().numpy()
     if (var=='SWIN') or (var=='PRECIP'): pred2 = pred2.clip(min=0)
 
-
     if PLOT:
         era5 = batch.coarse_inputs.cpu().numpy()
-        era5_unnorm = unnormalise_img(era5, var)
-        pred_unnorm = unnormalise_img(pred, var)
-        pred2_unnorm = unnormalise_img(pred2, var)
+        if var=='WS':
+            #era5_ws_unnorm = unnormalise_img(datgen.parent_pixels['hourly'].isel(time=it).ws.values, 'WS')
+            era5_unnorm = unnormalise_img(era5, 'UX')
+            pred_unnorm = unnormalise_img(pred, 'UX')
+            pred2_unnorm = unnormalise_img(pred2, 'UX')
+        else:
+            era5_unnorm = unnormalise_img(era5, var)
+            pred_unnorm = unnormalise_img(pred, var)
+            pred2_unnorm = unnormalise_img(pred2, var)
 
-        fig, ax = plt.subplots(1,3)
         cmap = cm.get_cmap('plasma')
         norm = Normalize(np.min(pred_unnorm), np.max(pred_unnorm))
         im = cm.ScalarMappable(cmap=cmap, norm=norm)
-        ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
-        ax[1].imshow(pred2_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
-        ax[2].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
-        ax[0].set_title(f'ERA5 {var}')
-        ax[1].set_title(f'Downscaled_nc {var}')
-        ax[2].set_title(f'Downscaled {var}')
+        if var=='WS':
+            fig, ax = plt.subplots(2,3)
+            ax[0,0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[0,1].imshow(pred2_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[0,2].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[1,0].imshow(era5_unnorm[0,1,::-1,:], cmap=cmap, norm=norm)
+            ax[1,1].imshow(pred2_unnorm[0,1,::-1,:], cmap=cmap, norm=norm)
+            ax[1,2].imshow(pred_unnorm[0,1,::-1,:], cmap=cmap, norm=norm)
+            ax[0,0].set_title(f'ERA5 UX')
+            ax[0,1].set_title(f'Downscaled UX nc')
+            ax[0,2].set_title(f'Downscaled UX')
+            ax[1,0].set_title(f'ERA5 VY')
+            ax[1,1].set_title(f'Downscaled VY nc')
+            ax[1,2].set_title(f'Downscaled VY')
+        else:
+            fig, ax = plt.subplots(1,3)        
+            ax[0].imshow(era5_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[1].imshow(pred2_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[2].imshow(pred_unnorm[0,0,::-1,:], cmap=cmap, norm=norm)
+            ax[0].set_title(f'ERA5 {var}')
+            ax[1].set_title(f'Downscaled_nc {var}')
+            ax[2].set_title(f'Downscaled {var}')
         fig.colorbar(im, ax=ax.ravel().tolist())
         plt.show()
-
+        
         b = 0
+        plot_batch_tiles(batch, pred, fine_vars, met_vars, b=b,
+                         sea_mask=None, trim_edges=False, constraints=False)
         plot_batch_tiles(batch, pred2, fine_vars, met_vars, b=b,
                          sea_mask=None, trim_edges=False, constraints=False)
 
@@ -276,26 +344,29 @@ for var in var_names:
             model_names=['this_model', 'this_model_nc']
         )
         
-        (calc_metrics(site_res['target']
+        print(calc_metrics(site_res['target']
             .pivot(columns='variable', index='SITE_ID', values='value'),
              var, 'this_model_nc')
         )
-        (calc_metrics(site_res['target']
+        print(calc_metrics(site_res['target']
             .pivot(columns='variable', index='SITE_ID', values='value'),
              var, 'this_model')
         )
         
-        (calc_metrics(site_res['context']
+        print(calc_metrics(site_res['context']
             .pivot(columns='variable', index='SITE_ID', values='value'),
             var, 'this_model_nc')
         )
-        (calc_metrics(site_res['context']
+        print(calc_metrics(site_res['context']
             .pivot(columns='variable', index='SITE_ID', values='value'),
             var, 'this_model')
         )
 
         plot_station_locations(batch.raw_station_dict, batch.fine_inputs, b,
                                plot_target=True, labels=False)
+
+
+
 
 
 # diminish_mask = distances > model_pars.dist_lim
@@ -309,6 +380,112 @@ for var in var_names:
 # plt.scatter(softmask[0,1,:,:].flatten(), softmask2[0,1,:,:].flatten())
 # plt.show()
 
+
+
+
+#################
+## visualising intelligent masking
+if type(var)==str: var = [var]    
+dist_lim = model_pars.dist_lim[var[0]]
+dist_lim_far = model_pars.dist_lim_far
+attn_eps=model_pars.attn_eps
+poly_exp = model_pars.poly_exp[var[0]]
+diminish_model = model_pars.diminish_model
+dist_pixpass = model_pars.dist_pixpass[var[0]]
+pass_exp = model_pars.pass_exp[var[0]]
+
+attn_masks = {
+    'context_soft_masks':[None, None, None, None],
+    'pixel_passers':     [None, None, None, None],
+    'context_masks':     [None, None, None, None]
+}
+b = 0
+site_meta = (pd.concat([batch.raw_station_dict[b]['context'],
+                        batch.raw_station_dict[b]['target']], axis=0)
+    .reset_index()
+)
+distances, softmask, scale_factors, site_yx, cntxt_stats = prepare_attn(
+    model,
+    batch,
+    site_meta,
+    None,
+    context_sites=None,
+    b=b,
+    dist_lim=dist_lim,
+    dist_lim_far=dist_lim_far,
+    attn_eps=attn_eps,
+    poly_exp=poly_exp,
+    diminish_model=diminish_model
+)
+
+cntxt_stats=cntxt_stats
+fine_inputs=batch.fine_inputs
+fine_variable_order=batch.batch_metadata[b]['fine_var_order']
+
+if type(var)==list: var=var[0]
+# context_soft_masks = [softmask]
+raw_context_masks = [torch.clone(softmask)]
+for i, sf in enumerate(scale_factors):
+    raw_context_masks.append(nn.functional.interpolate(
+        raw_context_masks[i],
+        scale_factor=sf,
+        mode='bilinear')
+    )
+    # context_soft_masks.append(nn.functional.interpolate(
+        # context_soft_masks[i],
+        # scale_factor=sf,
+        # mode='bilinear')
+    # )
+
+# apply shade / cloud affect on high-resolution soft masking
+if var=='SWIN' or var=='LWIN' or var=='PRECIP':
+    cloud_ind = fine_variable_order.index('cloud_cover')
+    if var=='SWIN':
+        shade_ind = fine_variable_order.index('shade_map')
+        illum_ind = fine_variable_order.index('illumination_map')
+
+    for i in range(cntxt_stats.shape[0]):
+        if var=='SWIN':
+            solar_dist = (
+                (fine_inputs[:,cloud_ind,:,:] - cntxt_stats.iloc[i].cloud_cover).square() + 
+                (fine_inputs[:,shade_ind,:,:] - cntxt_stats.iloc[i].shade_map).square() + 
+                (fine_inputs[:,illum_ind,:,:] - cntxt_stats.iloc[i].illumination_map).square()
+            ).sqrt()
+        else:
+            solar_dist = (fine_inputs[:,cloud_ind,:,:] - cntxt_stats.iloc[i].cloud_cover).abs()
+        
+        context_soft_masks[-1][:,i,:,:] = context_soft_masks[-1][:,i,:,:] - 5.*solar_dist
+        
+        # interpolate for lower res masks
+        solar_dists_sf = []
+        for j in range(2, len(scale_factors)+2):
+            context_soft_masks[-j][:,i:(i+1),:,:] = (context_soft_masks[-j][:,i:(i+1),:,:] -
+                5 * nn.functional.interpolate(
+                    solar_dist[None,...],
+                    size=context_soft_masks[-j][0,i,:,:].shape,
+                    mode='bilinear'
+                )
+            )
+        
+    ## visualise
+    fig, ax = plt.subplots(1,2, sharex=True, sharey=True)
+    j=3
+    i=44
+    ax[0].imshow(context_soft_masks[j].detach().numpy()[0,i,::-1,:], cmap='plasma')
+    ax[1].imshow(raw_context_masks[j].detach().numpy()[0,i,::-1,:], cmap='plasma')
+    plt.show()
+    
+    fig, ax = plt.subplots(1,2, sharex=True, sharey=True)
+    j=3
+    i=45
+    ax[0].imshow(np.exp(raw_context_masks[j].detach().numpy()[0,i,::-1,:]), cmap='plasma')
+    ax[1].imshow(np.exp(context_soft_masks[j].detach().numpy()[0,i,::-1,:]), cmap='plasma')    
+    plt.show()
+
+
+
+
+################
 
 
 ## loading and visualising
@@ -939,7 +1116,366 @@ plt.show()
 # ax[2,1].imshow(batch.fine_inputs[0,8,:,:].cpu().numpy()[::-1,:])
 # plt.show()
 
+########################
+## testing timing of batch generation
 
+# def get_batch(self, var, batch_size=1, batch_type='train',
+          # context_frac=None, p_hourly=1,
+          # date=None, parent_pixel_ids=[], times=[]):
+''' 
+when using date, parent_pixel_ids, times to select batches,
+date must be a datetime.date object
+parent_pixel_ids must be list of integers
+times must be a list of integers in {0,23}
+'''
+import time
+var = 'SWIN'
+batch_size=1
+batch_type='train'    
+context_frac=None
+p_hourly=1
+date=None
+parent_pixel_ids=[]
+times=[]
+
+ta0 = time.time()
+if not date is None: date_string = f'{date.year}{zeropad_strint(date.month)}{zeropad_strint(date.day)}'
+if parent_pixel_ids is None: parent_pixel_ids = []
+if times is None: times = []
+if type(parent_pixel_ids)==int: parent_pixel_ids = [parent_pixel_ids]
+if type(times)==int: times = [times]        
+if type(var)==str: var = [var]
+ta1 = time.time()
+ta = ta1-ta0
+''' quick '''
+
+tb0 = time.time()
+datgen.parent_pixels = {}
+if date is None:
+    datgen.parent_pixels['hourly'] = datgen.read_parent_pixel_day(batch_type=batch_type)
+else:                
+    datgen.parent_pixels['hourly'] = datgen.read_parent_pixel_day(batch_type=batch_type,
+                                                              date_string=date_string)
+    datgen.td = pd.to_datetime(datgen.parent_pixels['hourly'].time[0].values, utc=True)
+tb1 = time.time()
+tb = tb1-tb0
+''' quick '''
+
+tc0 = time.time()
+## work out the timesteps of the batch        
+batch_timesteps = np.random.choice(['daily', 'hourly'], batch_size,
+                                   p=[1-p_hourly, p_hourly])
+if ('daily' in batch_timesteps) and ('hourly' in batch_timesteps):
+    batch_tsteps = 'mix'
+elif batch_timesteps[0]=='daily':
+    batch_tsteps = 'daily'
+else:
+    batch_tsteps = 'hourly'
+
+if (batch_tsteps!='hourly'):
+    ## load chess data (don't normalise in case using in constraint preparation)
+    datgen.chess_var = list(datgen.var_name_map.loc[var].chess)
+    datgen.chess_dat = load_process_chess(datgen.td.year, datgen.td.month, datgen.td.day,
+                                        datgen.chess_var, normalise=False)
+tc1 = time.time()
+tc = tc1-tc0
+''' quick '''
+
+td0 = time.time()
+## process and normalise ERA5 parent_pixels
+datgen.prepare_era5_pixels(var, batch_tsteps=batch_tsteps)
+td1 = time.time()
+td = td1-td0
+''' slowest '''
+
+#prepare_era5_pixels:
+constraints=True
+if batch_tsteps=='daily':
+    ## average over the day
+    datgen.parent_pixels['daily'] = datgen.parent_pixels['hourly'].mean('time')
+    datgen.parent_pixels['hourly'] = None
+    tstep = 'daily'
+elif batch_tsteps=='hourly' or batch_tsteps=='mix':
+    tstep = 'hourly'
+    
+## convert wind vectors and dewpoint temp to wind speed and relative humidity        
+datgen.parent_pixels[tstep]['rh'] = relhum_from_dewpoint(
+    datgen.parent_pixels[tstep]['t2m'] - 273.15,
+    datgen.parent_pixels[tstep]['d2m'] - 273.15
+)
+datgen.parent_pixels[tstep]['ws'] = (np.sqrt(
+    np.square(datgen.parent_pixels[tstep]['v10']) +
+    np.square(datgen.parent_pixels[tstep]['u10']))
+)        
+
+td0a = time.time()
+if batch_tsteps!='daily':
+    if constraints:
+        # this requires particular units - do before changing them!
+        datgen.prepare_constraints(var)
+td1a = time.time()
+tda = td1a-td0a
+''' slowest! '''
+
+## load other large grids that we only wan to load once per batch
+td0b = time.time()
+if 'SWIN' in var:
+    # terrain shading used in hourly AND daily
+    doy = datgen.td.day_of_year - 1 # zero indexed
+    # datgen.shading_array = np.load(
+        # nz_train_path + f'/terrain_shading/shading_mask_day_{doy}_merged_to_7999.npy')
+    # datgen.sea_shading_array = np.load(
+        # nz_train_path + f'/terrain_shading/sea_shading_mask_day_{doy}_merged_to_7999.npy')
+    datgen.shading_ds = xr.open_dataset(nz_train_path + f'./terrain_shading/shading_mask_{doy}.nc')
+    datgen.shading_ds = datgen.shading_ds.shading
+        
+if ('SWIN' in var) or ('LWIN' in var) or ('PRECIP' in var) :
+    # cloud cover
+    tcc = xr.open_dataset(era5_fldr + f'/tcc/era5_{datgen.td.year}{zeropad_strint(datgen.td.month)}{zeropad_strint(datgen.td.day)}_tcc.nc')
+    datgen.tcc_1km = interp_to_grid(tcc.tcc, datgen.fine_grid, coords=['lat', 'lon'])
+    datgen.tcc_1km = reflect_pad_nans(datgen.tcc_1km.copy())
+td1b = time.time()
+tdb = td1b-td0b
+
+td0c = time.time()
+if ('PRECIP' in var):
+    datgen.gear = xr.open_dataset(precip_fldr + f'/{datgen.td.year}/CEH-GEAR-1hr-v2_{datgen.td.year}{zeropad_strint(datgen.td.month)}.nc')
+    # label centre of pixel
+    datgen.gear['x'] = datgen.gear.x + 500
+    datgen.gear['y'] = datgen.gear.y + 500
+    # subset to domain
+    datgen.gear = datgen.gear.sel(
+        x = np.intersect1d(datgen.gear.x, datgen.fine_grid.x),
+        y = np.intersect1d(datgen.gear.y, datgen.fine_grid.y)
+    )
+    # subset to day
+    day_inds = np.where(pd.to_datetime(datgen.gear.time.values, utc=True).day == datgen.td.day)[0]
+    datgen.gear = datgen.gear.isel(time = day_inds)
+td1c = time.time()
+tdc = td1c-td0c
+
+
+td0d = time.time()
+## change units
+datgen.parent_pixels[tstep]['t2m'].values -= 273.15 # K -> Celsius 
+datgen.parent_pixels[tstep]['d2m'].values -= 273.15 # K -> Celsius
+datgen.parent_pixels[tstep]['sp'].values /= 100.    # Pa -> hPa
+datgen.parent_pixels[tstep]['mtpr'].values *= 3600. # kg m2 s-1 -> mm in hour
+
+#datgen.parent_pixels[tstep] = datgen.parent_pixels[tstep].drop(['u10', 'v10', 'd2m'])
+datgen.parent_pixels[tstep] = datgen.parent_pixels[tstep].drop(['d2m'])
+
+## normalise ERA5        
+datgen.parent_pixels[tstep]['t2m'].values = (datgen.parent_pixels[tstep]['t2m'].values - nm.temp_mu) / nm.temp_sd        
+datgen.parent_pixels[tstep]['sp'].values = (datgen.parent_pixels[tstep]['sp'].values - nm.p_mu) / nm.p_sd        
+datgen.parent_pixels[tstep]['msdwlwrf'].values = (datgen.parent_pixels[tstep]['msdwlwrf'].values - nm.lwin_mu) / nm.lwin_sd        
+datgen.parent_pixels[tstep]['msdwswrf'].values = datgen.parent_pixels[tstep]['msdwswrf'].values / nm.swin_norm
+datgen.parent_pixels[tstep]['ws'].values = (datgen.parent_pixels[tstep]['ws'].values - nm.ws_mu) / nm.ws_sd
+datgen.parent_pixels[tstep]['u10'].values = (datgen.parent_pixels[tstep]['u10'].values) / nm.ws_sd
+datgen.parent_pixels[tstep]['v10'].values = (datgen.parent_pixels[tstep]['v10'].values) / nm.ws_sd
+datgen.parent_pixels[tstep]['rh'].values = (datgen.parent_pixels[tstep]['rh'].values - nm.rh_mu) / nm.rh_sd
+datgen.parent_pixels[tstep]['mtpr'].values = datgen.parent_pixels[tstep]['mtpr'].values / nm.precip_norm
+
+datgen.parent_pixels[tstep]['msdwswrf'] = datgen.parent_pixels[tstep]['msdwswrf'].clip(min=0)
+datgen.parent_pixels[tstep]['mtpr'] = datgen.parent_pixels[tstep]['mtpr'].clip(min=0)
+td1d = time.time()
+tdd = td1d-td0d
+
+td0e = time.time()
+## drop variables we don't need
+datgen.era5_var = list(datgen.var_name_map.loc[var].coarse)
+to_drop = list(datgen.parent_pixels[tstep].keys())
+for v in datgen.era5_var: to_drop.remove(v)
+#to_drop.remove('pixel_id') # not in era5 data anymore, moved to datgen.coarse_grid
+if 'RH' in var:
+    for exvar in datgen.rh_extra_met_vars:
+        cvar = datgen.var_name_map.loc[exvar].coarse
+        if cvar in to_drop:
+            to_drop.remove(cvar)
+if 'LWIN' in var:
+    for exvar in datgen.lwin_extra_met_vars:
+        cvar = datgen.var_name_map.loc[exvar].coarse
+        if cvar in to_drop:
+            to_drop.remove(cvar)
+if 'SWIN' in var:
+    for exvar in datgen.swin_extra_met_vars:
+        cvar = datgen.var_name_map.loc[exvar].coarse
+        if cvar in to_drop:
+            to_drop.remove(cvar)
+if 'PRECIP' in var:
+    for exvar in datgen.precip_extra_met_vars:
+        cvar = datgen.var_name_map.loc[exvar].coarse
+        if cvar in to_drop:
+            to_drop.remove(cvar)
+if 'WS' in var:
+    to_drop.remove('u10')
+    to_drop.remove('v10')
+    
+datgen.parent_pixels[tstep] = datgen.parent_pixels[tstep].drop(to_drop)
+td1e = time.time()
+tde = td1e-td0e
+
+td0f = time.time()
+# load data
+datgen.parent_pixels[tstep].load()
+td1f = time.time()
+tdf = td1f-td0f
+
+if batch_tsteps=='mix':
+    # do time-averaging for daily AFTER processing if mixed batch            
+    datgen.parent_pixels['daily'] = datgen.parent_pixels['hourly'].mean('time')   
+
+
+te0 = time.time()
+## get additional fine scale met vars for input
+datgen.prepare_fine_met_inputs(var, batch_tsteps)
+te1 = time.time()
+te = te1-te0
+''' slow '''
+
+if batch_tsteps!='hourly': # cover daily and mix
+    # pool to scale and fill in the parent pixels
+    for v in var:
+        cv = datgen.var_name_map.loc[v].chess
+        ev = datgen.var_name_map.loc[v].coarse
+        chess_pooled = pooling(datgen.chess_dat[cv].values, (datgen.scale, datgen.scale), method='mean')
+        chess_mask = ~np.isnan(chess_pooled)
+        datgen.parent_pixels['daily'][ev].values[chess_mask] = chess_pooled[chess_mask]   
+    
+    # solar values for daily timestep
+    datgen.calculate_day_av_solar_vars(var)
+
+coarse_inputs = []
+fine_inputs = []
+station_targets = []
+station_data = []
+station_num_obs = []
+constraint_targets = []
+context_locations = []
+batch_metadata = []
+for b in range(batch_size):
+    # try to select the parent pixel id and hour
+    if b <= (len(parent_pixel_ids)-1):
+        ppid = parent_pixel_ids[b]
+    else:
+        ppid = None
+    if b <= (len(times)-1): # assuming entire batch is hourly samples
+        _it = times[b]
+    else:
+        _it = None
+    
+    # generate batch from parent pixels
+    # sample = datgen.get_sample(var,
+                             # batch_type=batch_type,
+                             # context_frac=context_frac,
+                             # timestep=batch_timesteps[b],
+                             # parent_pixel_id=ppid,
+                             # it=_it)
+       # def get_sample(self, var, batch_type='train',
+                   # context_frac=None, 
+                   # timestep='hourly',
+                   # sample_xyt=True,
+                   # ix=None, iy=None, it=None,
+                   # return_constraints=True,
+                   # SID=None, parent_pixel_id=None):
+
+    batch_type=batch_type
+    context_frac=context_frac
+    timestep=batch_timesteps[b]
+    parent_pixel_id=ppid
+    it=_it
+    sample_xyt=True
+    ix=None
+    iy=None
+    it=None
+    return_constraints=True
+    SID=None
+    parent_pixel_id=None
+    
+    tf0 = time.time()
+    if sample_xyt:
+        ## sample a dim_l x dim_l tile
+        ix, iy, it = datgen.sample_xyt(batch_type=batch_type,
+                                     timestep=timestep,
+                                     SID=SID,
+                                     parent_pixel_id=parent_pixel_id,
+                                     it=it)
+    tf1 = time.time()
+    tf = tf1-tf0
+    ''' quick '''
+    
+    if it is None: it = 0 # hack for daily
+    
+    tg0 = time.time()
+    ## load input data
+    (coarse_input, fine_input, subdat,
+        x_inds, y_inds, lat_grid, lon_grid, timestamp) = datgen.get_input_data(
+        var, ix, iy, it, timestep=timestep
+    )
+    tg1 = time.time()
+    tg = tg1-tg0
+    ''' slow '''
+    
+    th0 = time.time()
+    ## get station targets within the dim_l x dim_l tile        
+    (station_targets, station_npts, 
+        station_data, context_locations) = datgen.get_station_targets(
+        subdat, x_inds, y_inds, timestamp, var,
+        np.stack([lat_grid, lon_grid], axis=0),
+        fine_input,
+        batch_type=batch_type,
+        context_frac=context_frac,            
+        timestep=timestep            
+    )
+    th1 = time.time()
+    th = th1-th0
+    ''' quick '''
+    
+    ti0 = time.time()
+    constraints = []
+    if return_constraints:
+        if timestep=='daily':
+            ## grab subgrid chess constraints                
+            for v in list(datgen.var_name_map.loc[var].chess):
+                constraints.append(torch.from_numpy(
+                    datgen.chess_dat.isel(x=x_inds, y=y_inds)[v].values)
+                    .to(torch.float32)
+                )
+        else:
+            ## use physically reasoned constraints
+            constraints = datgen.get_constraints(x_inds, y_inds, it, var)               
+    else:
+        constraints.append(torch.zeros((0,0)).to(torch.float32))
+    constraints = torch.stack(constraints, dim=-1)
+    ti1 = time.time()
+    ti = ti1-ti0
+    ''' quick '''
+    
+    ## capture sample description
+    sample_meta = {
+        'timestamp':datgen.td,
+        'x_inds':x_inds,
+        'y_inds':y_inds,
+        't_ind':it,
+        'coarse_xl':ix,
+        'coarse_yt':iy,
+        'timestep':timestep,
+        'fine_var_order':datgen.fine_variable_order,
+        'coarse_var_order':datgen.coarse_variable_order,
+        'context_var_order':datgen.context_variable_order
+    }
+
+   
+'''
+main culprits to pre-load:
+    self.prepare_constraints(var)
+    self.prepare_fine_met_inputs(var, batch_tsteps)
+
+'''
+   
+   
+
+##################
 
            
 '''

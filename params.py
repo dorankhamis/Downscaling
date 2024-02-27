@@ -7,34 +7,67 @@ data_pars = SimpleNamespace(
     heldout_years = [2017, 2018, 2019, 2020, 2021], #[2020, 2021],
     dim_l = 8, #8, # number of large pixels (dim_l x dim_l)
     scale = 28, # downsampling factor, 28km -> 1km, approx 0.25 degrees
-    res = 28000 # coarse resolution in metres
-    #use_precip = True
+    res = 28000 # coarse resolution in metres 
 )
 
 model_pars = SimpleNamespace(
     filters = [12, 24, 48, 96],
-    dropout_rate = 0.02,
-    ## current params
-    attn_heads = 2, #4
-    ds_cross_attn = [8, 12, 16, 20, 24],  
-
+    dropout_rate = 0.0,    
+    attn_heads = 2,
+    ds_cross_attn = [8, 12, 16, 20, 24],
     scale_factor = 3,
     pe = False, # positional encoding
+    
+    in_channels =      {'TA':1, 'PA':1, 'SWIN':1, 'LWIN':1, 'WS':2 , 'RH':1, 'PRECIP':1},
+    output_channels =  {'TA':1, 'PA':1, 'SWIN':1, 'LWIN':1, 'WS':2 , 'RH':1, 'PRECIP':1},
+    hires_fields =     {'TA':4, 'PA':4, 'SWIN':9, 'LWIN':7, 'WS':11, 'RH':5, 'PRECIP':8},
+    context_channels = {'TA':4, 'PA':4, 'SWIN':7, 'LWIN':5, 'WS':5 , 'RH':4, 'PRECIP':5},
+    
+    coarse_variable_order = {
+        'TA':['TA'],
+        'PA':['PA'],
+        'SWIN':['SWIN'],
+        'LWIN':['LWIN'],
+        'WS':['UX', 'VY'],
+        'RH':['RH'],
+        'PRECIP':['PRECIP']
+    },
+    fine_variable_order = {
+        'TA':['landfrac', 'elev', 'lat', 'lon'],
+        'PA':['landfrac', 'elev', 'lat', 'lon'],
+        'SWIN':['landfrac', 'elev', 'illumination_map', 'shade_map', 'solar_altitude', 'cloud_cover', 'PA', 'lat', 'lon'],
+        'LWIN':['landfrac', 'sky_view_factor', 'cloud_cover', 'RH', 'TA', 'lat', 'lon'],
+        'WS':['landfrac', 'stdev', 'aspect', 'slope', 'elev', 'l_wooded', 'l_open', 'l_mountain-heath', 'l_urban', 'lat', 'lon'],
+        'RH':['landfrac', 'TA', 'PA', 'lat', 'lon'],
+        'PRECIP':['landfrac', 'aspect', 'elev', 'cloud_cover', 'UX', 'VY', 'lat', 'lon']
+    },
+    context_variable_order = {
+        'TA':['var_value', 'elev', 'lat', 'lon'],
+        'PA':['var_value', 'elev', 'lat', 'lon'],
+        'SWIN':['var_value', 'elev', 'lat', 'lon', 'cloud_cover', 'shade_map', 'illumination_map'],
+        'LWIN': ['var_value', 'elev', 'lat', 'lon', 'cloud_cover'],
+        'WS':['var_value_u', 'var_value_v', 'elev', 'lat', 'lon'],
+        'RH':['var_value', 'elev', 'lat', 'lon'],
+        'PRECIP':['var_value', 'elev', 'lat', 'lon', 'cloud_cover']
+    },
+    
     ## attn params
-    dist_lim = 60, # mean==80 but could load var specific vals?
-    dist_lim_far = 90, # dist_lim + 50
-    attn_eps = 1e-6, # used when diminish_model=="gaussian"
-    poly_exp = 3., # 6 used when diminish_model=="polynomial"
-    diminish_model = "polynomial", # ["gaussian", "polynomial"]
-    dist_pixpass = 150,
-    pass_exp = 1.,
     soft_masks = True,
     pixel_pass_masks = True,
-    binary_masks = False
+    binary_masks = False,
+    
+    diminish_model = "polynomial", # ["gaussian", "polynomial"]
+    dist_lim = {'TA':80, 'PA':80, 'SWIN':80, 'LWIN':80, 'WS':80, 'RH':80, 'PRECIP':10},
+    poly_exp = {'TA':4,  'PA':4,  'SWIN':4,  'LWIN':4,  'WS':4,  'RH':4,  'PRECIP':6},
+    
+    dist_pixpass = {'TA':125, 'PA':125, 'SWIN':125, 'LWIN':125, 'WS':125, 'RH':125, 'PRECIP':25},
+    pass_exp =     {'TA':1.5, 'PA':1.5, 'SWIN':1.5, 'LWIN':1.5, 'WS':1.5, 'RH':1.5, 'PRECIP':3.},
+    
+    dist_lim_far = None, # used in binary masks
+    attn_eps = None # used when diminish_model=="gaussian"
 )
 
-train_pars = SimpleNamespace(
-    ensemble_size = None, # unused
+train_pars = SimpleNamespace(    
     batch_size = 5,
     warmup_epochs = 2, # num epochs with just daily batches
     increase_epochs = 5, # num epochs with p_hourly increasing
@@ -42,16 +75,17 @@ train_pars = SimpleNamespace(
     p_hourly_max = 1,
     lr = 1e-4, # 5e-5,
     gamma = 0.99, # learning rate reduction    
-    sigma_context_stations = 0.015, # those station values used as input
-    sigma_target_stations = 0.02, # those station values that only occur in the loss
-    sigma_constraints = 0.07,
-    sigma_gridavg = 0.06,
+    sigma_context_stations = {'TA':0.02, 'PA':0.02, 'SWIN':0.02, 'LWIN':0.02, 'WS':0.02, 'RH':0.02, 'PRECIP':0.02}, # those station values used as input
+    sigma_target_stations =  {'TA':0.025, 'PA':0.025, 'SWIN':0.025, 'LWIN':0.025, 'WS':0.025, 'RH':0.025, 'PRECIP':0.025}, # those station values that only occur in the loss
+    sigma_constraints =      {'TA':0.07,  'PA':0.07,  'SWIN':0.07,  'LWIN':0.07,  'WS':0.07,  'RH':0.07,  'PRECIP':0.07},
+    sigma_gridavg =          {'TA':0.05,  'PA':0.05,  'SWIN':0.05,  'LWIN':0.05,  'WS':0.05,  'RH':0.05,  'PRECIP':0.035},
     #sigma_localcont = 0.06, # unused
     train_len = 400,
-    val_len = 200,
-    attn_mask_sizes = [3, 5, 7, 9], # unused
+    val_len = 200,    
     use_unseen_sites = True,
-    null_batch_prob = 0.25 # unused
+    #attn_mask_sizes = [3, 5, 7, 9], # unused
+    #null_batch_prob = 0.25 # unused
+    #ensemble_size = None, # unused
 )
 train_pars.max_epochs = (train_pars.warmup_epochs + 
     train_pars.increase_epochs + 

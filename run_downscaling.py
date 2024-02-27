@@ -128,7 +128,7 @@ if __name__=="__main__":
                             batch.context_locs[ii:iinext],
                             context_masks=context_masks,
                             context_soft_masks=context_soft_masks,
-                            pixel_passer=pixel_passer)            
+                            pixel_passers=pixel_passer)            
 
             pred.append(out.cpu())
             del(out)            

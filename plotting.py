@@ -17,6 +17,32 @@ def to_np(arr):
     else:
         return arr
 
+def visualise_softmask_spatially(masks, level=0, b=0, site=0, exp=False):
+    Y = masks['pixel_passers'][level][b].shape[1]
+    X = masks['pixel_passers'][level][b].shape[2]
+    if exp:
+        plt.imshow(np.exp(
+                masks['context_soft_masks'][level][b]
+                    .reshape((1,Y,X,-1))
+                    .detach().numpy()
+                    [0,::-1,:,site]
+            )
+        )
+    else:
+        plt.imshow(
+            masks['context_soft_masks'][level][b]
+                .reshape((1,Y,X,-1))
+                .detach().numpy()
+                [0,::-1,:,site]
+        )
+    plt.show()
+    
+def visualise_pixelpasser(masks, level=0, b=0):
+    plt.imshow((masks['pixel_passers']
+        [level][b].detach().numpy()[0,::-1,:]
+    ))
+    plt.show()
+
 def density_scatter(x, y, ax=None, fig=None, sort=True, bins=20, 
                     cmap_name='hot', **kwargs):
     from matplotlib import colormaps    

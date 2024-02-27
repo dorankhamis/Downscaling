@@ -73,12 +73,12 @@ class SimpleDownscaler(nn.Module):
     # context_locs=batch.context_locs            
     # context_masks=masks['context_masks']
     # context_soft_masks=masks['context_soft_masks']
-    # pixel_passer=masks['pixel_passers']
+    # pixel_passers=masks['pixel_passers']
     def forward(self, coarse_inputs, fine_inputs,
                 context_data, context_locs,
                 context_masks=[None, None, None, None, None],
                 context_soft_masks=[None, None, None, None, None],
-                pixel_passer=[None, None, None, None, None]):
+                pixel_passers=[None, None, None, None, None]):
         # find intermediate scales
         coarse_size = coarse_inputs.shape[-1]
         hires_size = fine_inputs.shape[-1]
@@ -90,7 +90,7 @@ class SimpleDownscaler(nn.Module):
         x = self.grid_point_attn_0(x, context_data, context_locs, hires_size,
                                    mask=context_masks[0],
                                    softmask=context_soft_masks[0],
-                                   pixel_passer=pixel_passer[0])
+                                   pixel_passer=pixel_passers[0])
 
         for i in range(self.nups):
             # upscale
@@ -108,7 +108,7 @@ class SimpleDownscaler(nn.Module):
             x = self.grid_point_attn[i](x, context_data, context_locs, hires_size,
                                         mask=context_masks[i+1],
                                         softmask=context_soft_masks[i+1],
-                                        pixel_passer=pixel_passer[i+1])
+                                        pixel_passer=pixel_passers[i+1])
             
             # residual
             x = torch.cat([x, x_res], dim=1)
@@ -126,7 +126,7 @@ class SimpleDownscaler(nn.Module):
         x = self.grid_point_attn[i+1](x, context_data, context_locs, hires_size,
                                       mask=context_masks[i+2],
                                       softmask=context_soft_masks[i+2],
-                                      pixel_passer=pixel_passer[i+2])
+                                      pixel_passer=pixel_passers[i+2])
 
         # residual
         x = torch.cat([x, x_res], dim=1)

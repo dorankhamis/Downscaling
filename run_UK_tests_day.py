@@ -14,7 +14,7 @@ from sklearn.neighbors import NearestNeighbors
 
 from setupdata3 import (data_generator, Batch, create_chess_pred,
                         load_process_chess, interp_to_grid, reflect_pad_nans)
-from model2 import MetVAE, SimpleDownscaler
+from model2 import SimpleDownscaler
 from params import data_pars, model_pars, train_pars
 from loss_funcs2 import make_loss_func
 from step3 import create_null_batch
@@ -30,7 +30,7 @@ datgen = data_generator()
 projdir = '/home/users/doran/projects/downscaling/'
 
 if __name__=="__main__":
-    var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']
+    var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
     
     try:
         parser = argparse.ArgumentParser()        
@@ -46,6 +46,8 @@ if __name__=="__main__":
     ## output directory, shared by variables and hourly/daily data
     outdir = projdir + f'/output/uk_tests/{year}/'
     Path(outdir).mkdir(parents=True, exist_ok=True)
+    
+    datgen.load_EA_rain_gauge_data()
     
     ## hold out some training sites to check against
     ## then set context frac as 1 so all training sites are seen as context
@@ -72,7 +74,7 @@ if __name__=="__main__":
         hourly_data = pd.DataFrame()
         sites = list(datgen.site_data.keys())
         for sid in sites:            
-            thisdf = datgen.site_data[sid].reindex(index=tstamps, columns=var_names, fill_value=np.nan)
+            thisdf = datgen.site_data[sid].reindex(index=tstamps, columns=var_names+['UX', 'VY'], fill_value=np.nan)
             thisdf.dropna(how='all')            
             hourly_data = pd.concat([hourly_data, thisdf.assign(SITE_ID = sid)], axis=0)
         
@@ -90,18 +92,12 @@ if __name__=="__main__":
             specify_chkpnt = f'{model_name}/checkpoint.pth' # latest
             reset_chkpnt = False
 
-            ## dummy batch for model param fetching
-            batch = datgen.get_batch(var, batch_size=train_pars.batch_size,
-                                     batch_type='train',
-                                     load_binary_batch=False,
-                                     p_hourly=1)
-                                          
             ## create model
             model = SimpleDownscaler(
-                input_channels=batch['coarse_inputs'].shape[1],
-                hires_fields=batch['fine_inputs'].shape[1],
-                output_channels=batch['coarse_inputs'].shape[1],
-                context_channels=batch['station_data'][0].shape[1],
+                input_channels=model_pars.in_channels[var],
+                hires_fields=model_pars.hires_fields[var],
+                output_channels=model_pars.output_channels[var],
+                context_channels=model_pars.context_channels[var],
                 filters=model_pars.filters,
                 dropout_rate=model_pars.dropout_rate,
                 scale=data_pars.scale,
@@ -109,9 +105,8 @@ if __name__=="__main__":
                 attn_heads=model_pars.attn_heads,
                 ds_cross_attn=model_pars.ds_cross_attn,
                 pe=model_pars.pe
-             )
+            )
 
-            del(batch)
             model.to(device)
 
             ## create optimizer, schedulers and loss function
@@ -132,7 +127,7 @@ if __name__=="__main__":
             tstamps = [curr_date + datetime.timedelta(hours=int(dt)) for dt in it]
             tile = False
             p_hourly = 1
-            max_batch_size = 1        
+            max_batch_size = 1
             context_frac = 1
  
             daily_results = pd.DataFrame()
@@ -143,7 +138,7 @@ if __name__=="__main__":
             date_string = f'{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}'
             
             batch = datgen.get_all_space(var,
-                                         batch_type='train',                                         
+                                         batch_type='run',                                         
                                          context_frac=context_frac,
                                          date_string=date_string,
                                          it=it,
@@ -156,7 +151,7 @@ if __name__=="__main__":
             
             batch = Batch(batch, var_list=var, device=device, constraints=False)
             batch2 = create_null_batch(batch, constraints=False)
-            masks = create_attention_masks(model, batch, var) 
+            masks = create_attention_masks(model, batch, var)
             
             ii = 0
             pred = []
@@ -164,7 +159,8 @@ if __name__=="__main__":
             pred_era5 = []
             while ii<batch.coarse_inputs.shape[0]:
                 iinext = min(ii+max_batch_size, batch.coarse_inputs.shape[0])
-
+    
+                # extract this timepoint from the masks lists
                 context_masks = [[masks['context_masks'][r][ii]] for r in range(len(masks['context_masks']))]
                 context_soft_masks = [[masks['context_soft_masks'][r][ii]] for r in range(len(masks['context_soft_masks']))]
                 pixel_passer = [[masks['pixel_passers'][r][ii]] for r in range(len(masks['pixel_passers']))]
@@ -176,7 +172,7 @@ if __name__=="__main__":
                                 batch.context_locs[ii:iinext],
                                 context_masks=context_masks,
                                 context_soft_masks=context_soft_masks,
-                                pixel_passer=pixel_passer)    
+                                pixel_passers=pixel_passer)    
                     out2 = model(batch2.coarse_inputs[ii:iinext,...],
                                  batch2.fine_inputs[ii:iinext,...],
                                  batch2.context_data[ii:iinext],
@@ -188,18 +184,46 @@ if __name__=="__main__":
                 del(out2)
                 
                 # create era5 interped pred
-                era5_interp = interp_to_grid(datgen.parent_pixels['hourly'][
-                    datgen.var_name_map.loc[var].coarse][ii,:,:],
-                    datgen.fine_grid, coords=['lat', 'lon'])
-                era5_interp = reflect_pad_nans(era5_interp)
-                pred_era5.append(era5_interp.values[None, None, ...])
+                if var=='WS':
+                    era5_interp = interp_to_grid(datgen.parent_pixels['hourly'][
+                        datgen.var_name_map.loc[var].coarse][ii,:,:],
+                        datgen.fine_grid, coords=['lat', 'lon'])
+                    era5_interp = reflect_pad_nans(era5_interp).values[None, None, ...]
+                else:
+                    era5_interp_u10 = interp_to_grid(
+                        datgen.parent_pixels['hourly']['u10'][ii,:,:],
+                        datgen.fine_grid, coords=['lat', 'lon'])
+                    era5_interp_v10 = interp_to_grid(
+                        datgen.parent_pixels['hourly']['v10'][ii,:,:],
+                        datgen.fine_grid, coords=['lat', 'lon'])                        
+                    era5_interp_u10 = reflect_pad_nans(era5_interp_u10)
+                    era5_interp_v10 = reflect_pad_nans(era5_interp_v10)
+                    era5_interp = np.stack([
+                        era5_interp_u10.values[None, ...],
+                        era5_interp_v10.values[None, ...]], axis=1)
+                pred_era5.append(era5_interp)
                 
                 ii += max_batch_size
+                
             pred = torch.cat(pred, dim=0).numpy()
-            pred_dayav = pred.mean(axis=0)
             pred2 = torch.cat(pred2, dim=0).numpy()
-            pred2_dayav = pred2.mean(axis=0)
             pred_era5 = np.concatenate(pred_era5, axis=0)
+            if var=='WS':
+                # add wind speed as third element                
+                ws_pred = np.sqrt(np.square(pred[:,0:1,:,:] * nm.ws_sd) + np.square(pred[:,1:2,:,:] * nm.ws_sd))
+                ws_pred = (ws_pred - nm.ws_mu) / nm.ws_sd
+                pred = np.concatenate([pred, ws_pred], axis=1)
+                
+                ws_pred = np.sqrt(np.square(pred2[:,0:1,:,:] * nm.ws_sd) + np.square(pred2[:,1:2,:,:] * nm.ws_sd))
+                ws_pred = (ws_pred - nm.ws_mu) / nm.ws_sd
+                pred2 = np.concatenate([pred2, ws_pred], axis=1)
+                
+                ws_pred = np.sqrt(np.square(pred_era5[:,0:1,:,:] * nm.ws_sd) + np.square(pred_era5[:,1:2,:,:] * nm.ws_sd))
+                ws_pred = (ws_pred - nm.ws_mu) / nm.ws_sd
+                pred_era5 = np.concatenate([pred_era5, ws_pred], axis=1)
+            
+            pred_dayav = pred.mean(axis=0)            
+            pred2_dayav = pred2.mean(axis=0)            
             pred_era5_dayav = pred_era5.mean(axis=0)
             del(batch2)
             
@@ -237,30 +261,41 @@ if __name__=="__main__":
             ## from here we only retain pixels containing met sites
             
             # retrieve day-averaged site data
+            
+            if False:
+                datgen.daily_site_data = {}
+                for SID in list(datgen.site_data.keys()):
+                    datgen.daily_site_data[SID] = datgen.site_data[SID].resample('1D').mean()
+            
             daily_data = datgen.site_metadata[
-                ['SITE_ID', 'LATITUDE', 'LONGITUDE', 'chess_y', 'chess_x', 'parent_pixel_id']]
-            day_av = []
-            for sid in daily_data.SITE_ID:
+                ['SITE_ID', 'LATITUDE', 'LONGITUDE', 'chess_y', 'chess_x', 'parent_pixel_id']
+            ]            
+            if var=='WS':
+                sel_vars = ['UX', 'VY', 'WS']
+            else:
+                sel_vars = [var]
+            day_av = np.zeros((len(daily_data.SITE_ID), len(sel_vars)))
+            for i, sid in enumerate(daily_data.SITE_ID):
                 try:
                     if datgen.site_points_present[sid].loc[datgen.td, var]==24:
-                        day_av.append(datgen.daily_site_data[sid].loc[datgen.td, var])
+                        day_av[i,:] = datgen.daily_site_data[sid].loc[datgen.td, sel_vars].values
                     else:
-                        day_av.append(np.nan)
+                        day_av[i,:] = np.array([np.nan]*len(sel_vars))
                 except:
-                    day_av.append(np.nan)
-            daily_data[var] = day_av
+                    day_av[i,:] = np.array([np.nan]*len(sel_vars))
+            daily_data[sel_vars] = day_av
 
             # extract site values from grids
-            site_preds_d = pred_dayav[0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
-            site_preds2_d = pred2_dayav[0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
-            site_preds_era5_d = pred_era5_dayav[0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
+            site_preds_d = pred_dayav[:, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
+            site_preds2_d = pred2_dayav[:, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
+            site_preds_era5_d = pred_era5_dayav[:, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
             site_preds_chess = pred3[site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
-            site_obs = daily_data[var]
+            site_obs = daily_data[sel_vars]
             
-            daily_data['pred_model'] = site_preds_d
-            daily_data['pred_model_nc'] = site_preds2_d
-            daily_data['pred_era5_interp'] = site_preds_era5_d
-            daily_data['pred_chess'] = site_preds_chess
+            daily_data[[s+'_pred_model' for s in sel_vars]] = site_preds_d.T
+            daily_data[[s+'_pred_model_nc' for s in sel_vars]] = site_preds2_d.T
+            daily_data[[s+'_pred_era5_interp' for s in sel_vars]] = site_preds_era5_d.T
+            daily_data[[var + '_pred_chess']] = site_preds_chess[:,None]
             daily_data = daily_data.assign(DATE_TIME = curr_date)
             
             daily_results = pd.concat([daily_results, daily_data], axis=0)
@@ -297,41 +332,51 @@ if __name__=="__main__":
                 dtr_daily_results.to_csv(outdir +f'/DTR_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_daily.csv', index=False)
             
             ## get hourly results
-            site_preds_h = pred[:, 0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
-            site_preds2_h = pred2[:, 0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
-            site_preds_era5_h = pred_era5[:, 0, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
+            site_preds_h_arr = pred[:, :, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
+            site_preds2_h_arr = pred2[:, :, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
+            site_preds_era5_h_arr = pred_era5[:, :, site_chess_yx.chess_y.values, site_chess_yx.chess_x.values]
 
             del(pred)
             del(pred2)
             del(pred_era5)
             
-            site_preds_h = pd.DataFrame(site_preds_h)
-            site_preds_h.columns = daily_data.SITE_ID.values
-            site_preds_h = site_preds_h.assign(DATE_TIME = tstamps)            
-            site_preds_h = site_preds_h.melt(id_vars='DATE_TIME',
-                                             var_name='SITE_ID',
-                                             value_name='pred_model')
-            
-            site_preds2_h = pd.DataFrame(site_preds2_h)
-            site_preds2_h.columns = daily_data.SITE_ID.values
-            site_preds2_h = site_preds2_h.assign(DATE_TIME = tstamps)
-            site_preds2_h = site_preds2_h.melt(id_vars='DATE_TIME',
-                                               var_name='SITE_ID',
-                                               value_name='pred_model_nc')
-            
-            site_preds_era5_h = pd.DataFrame(site_preds_era5_h)
-            site_preds_era5_h.columns = daily_data.SITE_ID.values
-            site_preds_era5_h = site_preds_era5_h.assign(DATE_TIME = tstamps)
-            site_preds_era5_h = site_preds_era5_h.melt(id_vars='DATE_TIME',
-                                                       var_name='SITE_ID',
-                                                       value_name='pred_era5_interp')
-            
+            for i, v in enumerate(sel_vars):
+                sph = pd.DataFrame(site_preds_h_arr[:,i,:])
+                sph.columns = daily_data.SITE_ID.values
+                sph = sph.assign(DATE_TIME = tstamps)            
+                sph = sph.melt(id_vars='DATE_TIME',
+                               var_name='SITE_ID',
+                               value_name=v+'_pred_model')
+                
+                sp2h = pd.DataFrame(site_preds2_h_arr[:,i,:])
+                sp2h.columns = daily_data.SITE_ID.values
+                sp2h = sp2h.assign(DATE_TIME = tstamps)
+                sp2h = sp2h.melt(id_vars='DATE_TIME',
+                                 var_name='SITE_ID',
+                                 value_name=v+'_pred_model_nc')
+                
+                spe5h = pd.DataFrame(site_preds_era5_h_arr[:,i,:])
+                spe5h.columns = daily_data.SITE_ID.values
+                spe5h = spe5h.assign(DATE_TIME = tstamps)
+                spe5h = spe5h.melt(id_vars='DATE_TIME',
+                                   var_name='SITE_ID',
+                                   value_name=v+'_pred_era5_interp')
+                
+                if i==0:
+                    site_preds_h = sph.copy()
+                    site_preds2_h = sp2h.copy()
+                    site_preds_era5_h = spe5h.copy()
+                else:
+                    site_preds_h = pd.merge(site_preds_h, sph, on=['DATE_TIME', 'SITE_ID'], how='left')
+                    site_preds2_h = pd.merge(site_preds2_h, sp2h, on=['DATE_TIME', 'SITE_ID'], how='left')
+                    site_preds_era5_h = pd.merge(site_preds_era5_h, spe5h, on=['DATE_TIME', 'SITE_ID'], how='left')
+                
             hourly_res = (site_preds_h
                 .merge(site_preds2_h, on=['DATE_TIME', 'SITE_ID'], how='left')
                 .merge(site_preds_era5_h, on=['DATE_TIME', 'SITE_ID'], how='left')
             )
             hourly_res['DATE_TIME'] = pd.to_datetime(hourly_res.DATE_TIME, utc=True)
-            hourly_res = hourly_res.merge(hourly_data.reset_index()[['DATE_TIME', 'SITE_ID', var]],
+            hourly_res = hourly_res.merge(hourly_data.reset_index()[['DATE_TIME', 'SITE_ID'] + sel_vars],
                                           on=['DATE_TIME', 'SITE_ID'], how='left')
             del(site_preds_h)
             del(site_preds2_h)

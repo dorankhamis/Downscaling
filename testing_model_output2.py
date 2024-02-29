@@ -21,14 +21,6 @@ from plotting import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-''' 
-
-Train without attention masks?
-Output constraints for the training set to speed up training?
-
-'''
-
 ## create data generator
 datgen = data_generator()
 

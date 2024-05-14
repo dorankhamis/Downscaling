@@ -10,8 +10,8 @@ from sklearn.neighbors import NearestNeighbors
 import sklearn.metrics as metrics
 import torch.nn as nn
 
-from downscaling.params import normalisation as nm
-from downscaling.params import data_pars, model_pars
+from downscaling.params2 import normalisation as nm
+from downscaling.params2 import data_pars, model_pars
 
 EPS = 1e-30
 
@@ -37,6 +37,8 @@ def unnormalise(dat, var, names):
         dat[['VY']+names] = dat[['VY']+names] * nm.ws_sd
     if var=='RH':
         dat[[var]+names] = dat[[var]+names] * nm.rh_sd + nm.rh_mu
+    if var=='PRECIP':
+        dat[[var]+names] = dat[[var]+names] * nm.precip_norm
     if var=='DTR': # daily temp range
         dat[[var]+names] = dat[[var]+names] * nm.temp_sd
     return dat
@@ -56,6 +58,8 @@ def unnormalise_img(dat, var):
         dat = dat * nm.ws_sd
     if var=='RH':
         dat = dat * nm.rh_sd + nm.rh_mu
+    if var=='PRECIP':
+        dat = dat * nm.precip_norm
     if var=='DTR': # daily temp range
         dat = dat * nm.temp_sd
     return dat
@@ -951,11 +955,25 @@ def create_filter(filt_size, filt_vals=None):
         gfilt[(filt_size//2 - i):(filt_size//2 + i), filt_size//2 + i]  += filt_vals[i]
     return gfilt
 
+def vapour_pressure_from_dewpoint(dewpoint_temp):
+    ''' dewpoint in K, returns e in hPa '''
+    return 6.112 * np.exp((2.5008e6 / 461.52) * (1./273.16 - 1./dewpoint_temp))
+
 def relhum_from_dewpoint(air_temp, dewpoint_temp):
     ''' for temperatures in degrees C '''
     # RH calc from https://www.omnicalculator.com/physics/relative-humidity
     return 100 * (np.exp((17.625 * dewpoint_temp)/(243.04 + dewpoint_temp)) / 
                     np.exp((17.625 * air_temp)/(243.04 + air_temp)))
+                    
+def dewpoint_from_relhum(air_temp, relhum):
+    ''' for temperatures in degrees C, relative humidity in % '''
+    # RH calc from https://www.omnicalculator.com/physics/relative-humidity
+    factor = (np.log(relhum/100) + (17.625 * air_temp)/(243.04 + air_temp)) / 17.625
+    return 243.04 / (1./factor - 1)
+
+def specifichum_from_vapour_pressure(vapour_pressure, air_pressure):
+    ''' requires pressures in same units, returns q in kg/kg '''
+    return (0.622 * vapour_pressure)/(air_pressure - (0.378 * vapour_pressure))
 
 def make_mask(dim_i, dim_j):
     # this could be rewritten using the flexible-sized filter 

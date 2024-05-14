@@ -13,14 +13,15 @@ import math
 
 from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
+from sklearn.gaussian_process.kernels import RBF
 from scipy.ndimage import gaussian_filter
 
 from downscaling.timeout import Timeout
 from downscaling.data_classes.met_data import ERA5Data
 from downscaling.data_classes.cosmos_data import CosmosMetaData, CosmosData
-from downscaling.utils import *
-from downscaling.params import normalisation as nm
-from downscaling.params import data_pars as dp
+from downscaling.utils2 import *
+from downscaling.params2 import normalisation as nm
+from downscaling.params2 import data_pars as dp
 from downscaling.solar_position import SolarPosition
 
 EPS = 1e-10
@@ -315,22 +316,23 @@ def calculate_illumination_map(sp, grid, height_grid):
     )
     return solar_illum
 
-
-# swin_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['SWIN'].coarse][it,:,:] * nm.swin_norm # de-nornmalise!
-# fine_grid = dg.fine_grid
-# sp = dg.sp
-# press_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu # de-nornmalise
-# press_fine = dg.p_1km_elev[it,:,:]
-# height_grid = dg.height_grid
-# shading_array = dg.shading_array[it,:]
-# sea_shading_array = dg.sea_shading_array[it,:]
-# scale = dg.scale
-# sky_view_factor = dg.skyview_map
-
 def partition_interp_solar_radiation(swin_coarse, fine_grid, sp,
-                                     press_coarse, press_fine,
+                                     #press_coarse, press_fine,
                                      height_grid, shade_map,
                                      scale, sky_view_factor):
+                                         
+    if False:
+        swin_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['SWIN'].coarse][it,:,:] * nm.swin_norm # de-nornmalise!
+        fine_grid = dg.fine_grid
+        sp = dg.sp
+        #press_coarse = dg.parent_pixels['hourly'][dg.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu # de-nornmalise
+        #press_fine = dg.p_1km_elev[it,:,:]
+        height_grid = dg.height_grid
+        shade_map = dg.shading_ds.isel(time=it)
+        scale = dg.scale
+        sky_view_factor = dg.skyview_map
+                                         
+                                         
     # A Physically Based Atmospheric Variables Downscaling Technique,
     # TASNUVA ROUF et al. (2019)
     if np.all(swin_coarse.values==0):
@@ -377,26 +379,21 @@ def partition_interp_solar_radiation(swin_coarse, fine_grid, sp,
         # terrain illumination/shading
         cos_solar_illum = calculate_illumination_map(sp, fine_grid, height_grid)
 
-        # add shade map        
-        # shade_map = (fine_grid.landfrac.copy()).astype(np.float32)        
-        # shade_map.values[fine_grid.landfrac.values>0] = -(shading_array-1) # invert shade to zero
-        # shade_map.values[fine_grid.landfrac.values==0] = -(sea_shading_array-1) # invert shade to zero
+        # # broadband attenuation
+        # press_coarse.load()
+        # p_interp = interp_to_grid(press_coarse, fine_grid, coords=['lat', 'lon'])        
+        # p_interp = reflect_pad_nans(p_interp.load().copy())
         
-        # broadband attenuation
-        press_coarse.load()
-        p_interp = interp_to_grid(press_coarse, fine_grid, coords=['lat', 'lon'])        
-        p_interp = reflect_pad_nans(p_interp.load().copy())
+        # mask = sp.solar_zenith_angle <= 90
+        # broadband_attenuation = fine_grid.landfrac.copy()
+        # broadband_attenuation.values[:,:] = 0
+        # broadband_attenuation.values[mask] = - (
+            # (np.log(I0 * np.cos(np.deg2rad(sp.solar_zenith_angle.values[mask])) + EPS) - 
+                # np.log(S_dir.values[mask] + EPS)) / p_interp.values[mask]
+        # )
         
-        mask = sp.solar_zenith_angle <= 90
-        broadband_attenuation = fine_grid.landfrac.copy()
-        broadband_attenuation.values[:,:] = 0
-        broadband_attenuation.values[mask] = - (
-            (np.log(I0 * np.cos(np.deg2rad(sp.solar_zenith_angle.values[mask])) + EPS) - 
-                np.log(S_dir.values[mask] + EPS)) / p_interp.values[mask]
-        )
-        
-        press_fine = reflect_pad_nans(press_fine.load().copy())
-        S_dir.values *= shade_map.values * cos_solar_illum.values * np.exp(broadband_attenuation.values * (press_fine.values - p_interp.values))        
+        # press_fine = reflect_pad_nans(press_fine.load().copy())
+        S_dir.values *= shade_map.values * cos_solar_illum.values# * np.exp(broadband_attenuation.values * (press_fine.values - p_interp.values))
         
         ## reflected
         # Modeling Topographic Solar Radiation Using GOES Data, R. Dubayah and S. Loechel
@@ -553,14 +550,8 @@ class Batch:
         self.target_num_obs = [m.copy() for m in other_batch.target_num_obs]
 
 
-
 class data_generator():
-    def __init__(self, train_sites=None, heldout_sites=None, load_site_data=True, precip_sites=False):
-        
-        # load 1km bng grid        
-        #self.chess_grid = xr.open_dataset(hj_ancil_fldr+'/chess_lat_lon.nc')
-        #self.chess_grid = self.fine_grid.load() # force load data
-        
+    def __init__(self, train_sites=None, heldout_sites=None, load_site_data=True, precip_sites=False):                
         self.met_cls = ERA5Data()
         
         self.wgs84_epsg = 4326
@@ -636,24 +627,29 @@ class data_generator():
 
         self.rh_extra_met_vars = ['TA', 'PA']
         self.lwin_extra_met_vars = ['RH', 'TA']
-        self.swin_extra_met_vars = ['PA']
-        self.precip_extra_met_vars = ['UX', 'VY']
+        self.swin_extra_met_vars = []
+        self.precip_extra_met_vars = []
         
         self.targ_var_depends = {}
-        self.targ_var_depends['TA'] = ['landfrac', 'elev']
-        self.targ_var_depends['PA'] = ['landfrac', 'elev']
-        self.targ_var_depends['SWIN'] = ['landfrac', 'elev',
+        self.targ_var_depends['TA'] = ['elev', 'constraint']
+        self.targ_var_depends['PA'] = ['elev', 'constraint']
+        self.targ_var_depends['SWIN'] = ['elev', 'stdev',
                                          'illumination_map',                                         
                                          'solar_altitude',
-                                         'cloud_cover'] + self.swin_extra_met_vars
-        self.targ_var_depends['LWIN'] = ['landfrac',
-                                         'sky_view_factor',
-                                         'cloud_cover'] + self.lwin_extra_met_vars
-        self.targ_var_depends['WS'] = ['landfrac', 'elev', 'stdev',
-                                       'aspect', 'slope', 'land_cover']
-        self.targ_var_depends['RH'] = ['landfrac'] + self.rh_extra_met_vars
-        self.targ_var_depends['PRECIP'] = ['landfrac', 'elev', 'cloud_cover',
-                                           'aspect'] + self.precip_extra_met_vars        
+                                         'cloud_cover',
+                                         'constraint'] + self.swin_extra_met_vars
+        self.targ_var_depends['LWIN'] = ['sky_view_factor',
+                                         'cloud_cover',
+                                         'constraint'] + self.lwin_extra_met_vars
+        self.targ_var_depends['WS'] = ['elev', 'stdev',
+                                       'aspect', 'slope', 'land_cover',
+                                       'constraint_ux', 'constraint_vy']
+        self.targ_var_depends['RH'] = self.rh_extra_met_vars
+        self.targ_var_depends['PRECIP'] = ['elev',
+                                           'cloud_cover',
+                                           'aspect',
+                                           'constraint_val',
+                                           'constraint_dens'] + self.precip_extra_met_vars        
         
         ## deal with site data
         # load site metadata/locations
@@ -771,9 +767,13 @@ class data_generator():
                 
                 # air pressure
                 self.site_data[SID].loc[:, ['PA']] = (self.site_data[SID].loc[:, ['PA']] - nm.p_mu) / nm.p_sd
+                # remove outliers
+                self.site_data[SID].loc[self.site_data[SID].PA < -5, 'PA'] = np.nan
                 
                 # relative humidity            
                 self.site_data[SID].loc[:, ['RH']] = (self.site_data[SID].loc[:, ['RH']] - nm.rh_mu) / nm.rh_sd
+                # remove outliers
+                self.site_data[SID].loc[self.site_data[SID].RH > 2, 'RH'] = np.nan
                 
                 # temperature
                 #print(self.site_data[SID].loc[:, ['TA']].mean()) check T is in Kelvin?
@@ -797,6 +797,8 @@ class data_generator():
             for SID in list(self.site_data.keys()):
                 self.site_points_present[SID] = self.site_data[SID].groupby(pd.Grouper(freq='D')).count()
                 self.daily_site_data[SID] = self.site_data[SID].resample('1D').mean()
+        
+        
         
         # indices in a dim_h x dim_h grid
         X1 = np.where(np.ones((self.dim_h, self.dim_h)))
@@ -942,33 +944,6 @@ class data_generator():
         
         era5_dat = xr.open_mfdataset(era5_filelist)
         
-        # if False:
-            # #self.era5_dat = xr.open_mfdataset(era5_filelist)
-            # # because these are already on the BNG at 1km, find are averages of 25x25 squares        
-            # self.parent_pixels[timestep] = self.parent_pixels[timestep].assign_coords(
-                # {'time':self.era5_dat.time.values}
-            # )
-            # ys = self.parent_pixels[timestep].y.shape[0] - 1
-            # xs = self.parent_pixels[timestep].x.shape[0] - 1
-            # ts = self.parent_pixels[timestep].time.shape[0]
-            # for var in era5_vars:
-                # self.parent_pixels[timestep][var] = (['time', 'y', 'x'],
-                                          # np.ones((ts, ys, xs), dtype=np.float32)*np.nan)
-                # source = self.era5_dat[var].values
-                # self.parent_pixels[timestep][var] = (('time', 'y', 'x'), 
-                    # skimage.measure.block_reduce(
-                        # source, (1, self.scale, self.scale), np.mean
-                    # )[:ts,:ys,:xs] # trim right/bottom edges
-                # )
-            # del(source)
-            # del(self.era5_dat)
-        
-        ## if loading raw lat/lon projection
-        # reproject and regrid onto 28km BNG
-        # self.era5_dat = self.era5_dat.rio.write_crs(rasterio.crs.CRS.from_epsg(self.wgs84_epsg))
-        # self.era5_dat = self.era5_dat.rio.reproject(f"EPSG:{self.bng_epsg}")
-        # self.era5_dat = self.era5_dat.interp_like(self.coarsegrid)
-        
         return era5_dat
 
     def sample_xyt(self, batch_type='train', timestep='daily',
@@ -1008,7 +983,7 @@ class data_generator():
             it = np.random.randint(0, 24)
         return ix, iy, it
 
-    def get_input_data(self, var, ix=None, iy=None, it=0, timestep='daily'):        
+    def get_subset_region(self, it, var=None, ix=None, iy=None, timestep='hourly'):
         if (ix is None) and (iy is None):
             # for rectangular grid over whole space
             if timestep=='daily':
@@ -1027,12 +1002,18 @@ class data_generator():
             subdat['pixel_id'] = self.coarse_grid.pixel_id.isel(y=range(iy, iy+self.dim_l),
                                                                 x=range(ix, ix+self.dim_l))
         
+        # subset hi-res fields to the chosen coarse tile
+        x_inds = np.intersect1d(np.where(self.fine_grid.x.values < int(subdat.x.max().values) + self.res//2),
+                                np.where(self.fine_grid.x.values > int(subdat.x.min().values) - self.res//2))
+        y_inds = np.intersect1d(np.where(self.fine_grid.y.values < int(subdat.y.max().values) + self.res//2),
+                                np.where(self.fine_grid.y.values > int(subdat.y.min().values) - self.res//2))
+
         if timestep=='daily':
             timestamp = self.td
         else:
             timestamp = pd.to_datetime(
                 self.parent_pixels[timestep].time.values[it], utc=True
-            )
+            ) 
         
         if timestep!='daily':
             if 'SWIN' in var or 'LWIN' in var:
@@ -1041,16 +1022,13 @@ class data_generator():
                 self.sp.calc_solar_angles(self.fine_grid.lat, self.fine_grid.lon)
             if 'SWIN' in var:
                 self.solar_illum_map = calculate_illumination_map(self.sp, self.fine_grid, self.height_grid)
-                #self.shade_map = self.fine_grid.lat.copy()                
-                #self.shade_map.values[self.fine_grid.landfrac.values>0] = -(self.shading_array[it,:] - 1)
-                #self.shade_map.values[self.fine_grid.landfrac.values==0] = -(self.sea_shading_array[it,:] - 1)                
                 self.shade_map = self.shading_ds.isel(time=it)
-        
+
+        return subdat, x_inds, y_inds, timestamp
+
+    def get_input_data(self, var, subdat, x_inds, y_inds, it, timestep='daily'):
+
         # subset hi-res fields to the chosen coarse tile
-        x_inds = np.intersect1d(np.where(self.fine_grid.x.values < int(subdat.x.max().values) + self.res//2),
-                                np.where(self.fine_grid.x.values > int(subdat.x.min().values) - self.res//2))
-        y_inds = np.intersect1d(np.where(self.fine_grid.y.values < int(subdat.y.max().values) + self.res//2),
-                                np.where(self.fine_grid.y.values > int(subdat.y.min().values) - self.res//2))
         sub_grid = self.fine_grid.isel(y=y_inds, x=x_inds)
         sub_topog = self.height_grid.isel(y=y_inds, x=x_inds)
         
@@ -1075,11 +1053,7 @@ class data_generator():
                 sub_sun_hours = self.sun_hrs.isel(y=y_inds, x=x_inds)
             else:
                 sub_sol_azimuth = self.sp.solar_azimuth_angle.isel(y=y_inds, x=x_inds)
-                sub_sol_altitude = self.sp.solar_elevation.isel(y=y_inds, x=x_inds)
-                sub_sun_hours = sub_sol_altitude.copy()
-                sub_sun_hours.values = (sub_sun_hours.values > 0).astype(np.int32)                
-                # smooth edges to account for time resolution inaccuracy
-                sub_sun_hours.values = gaussian_filter(sub_sun_hours.values, sigma=15)
+                sub_sol_altitude = self.sp.solar_elevation.isel(y=y_inds, x=x_inds)                
         
         if 'LWIN' in var:
             sub_skyview = self.skyview_map.isel(y=y_inds, x=x_inds)            
@@ -1117,7 +1091,8 @@ class data_generator():
         coarse_input = torch.stack(coarse_input, dim=-1)
 
         # get static inputs at the high resolution
-        fine_input = torch.from_numpy(sub_grid['landfrac'].values).to(torch.float32)[...,None]
+        #fine_input = torch.from_numpy(sub_grid['landfrac'].values).to(torch.float32)[...,None]
+        fine_input = torch.zeros((len(sub_grid.y), len(sub_grid.x), 0)).to(torch.float32)
         use_elev_vars = []
         for v in var:
             use_elev_vars += list(set(self.elev_vars) & set(self.targ_var_depends[v]))
@@ -1129,9 +1104,10 @@ class data_generator():
                                         for vv in use_elev_vars
                             ], dim=-1),
                 ], dim=-1
-            )        
-        # initial fine scale variable order is
-        self.fine_variable_order = ['landfrac'] + use_elev_vars
+            )
+            
+        # initial fine scale variable order is            
+        self.fine_variable_order = use_elev_vars
         
         if 'SWIN' in var:
             # add illumination and terrain shading maps
@@ -1154,14 +1130,6 @@ class data_generator():
                 torch.from_numpy(sub_skyview.values).to(torch.float32)[...,None],                
                 ], dim = -1)
             self.fine_variable_order += ['sky_view_factor']
-            
-        # if 'solar_azimuth' in self.targ_var_depends[var]:
-            # # add azimuthal angle          
-            # sub_sol_azimuth = np.deg2rad(sub_sol_azimuth.values)  
-            # fine_input = torch.cat([fine_input,
-                # torch.from_numpy(sub_sol_azimuth).to(torch.float32)[...,None]
-                # ], dim = -1)
-            # self.fine_variable_order += ['solar_azimuth']
         
         if ('LWIN' in var) or ('SWIN' in var) or ('PRECIP' in var):           
             # add cloud cover            
@@ -1223,21 +1191,130 @@ class data_generator():
                         torch.from_numpy(sub_met_dat[vname].values).to(torch.float32)[...,None]
                         ], dim = -1)
                     self.fine_variable_order += [exv]
-        
-        # add lat/lon (always last two finescale inputs
-        fine_input = torch.cat([fine_input,                            
-                            torch.from_numpy(lat_grid).to(torch.float32)[...,None],
-                            torch.from_numpy(lon_grid).to(torch.float32)[...,None]
-                            ], dim = -1)
-        self.fine_variable_order += ['lat', 'lon']
-        
-        return (coarse_input, fine_input, subdat, x_inds, y_inds, 
-                lat_grid, lon_grid, timestamp)
+               
+        return (coarse_input, fine_input, lat_grid, lon_grid)
 
-    def get_station_targets(self, subdat, x_inds, y_inds, timestamp, 
-                            var, latlon_grid, fine_input, batch_type='train',
-                            trim_edge_sites=True, context_frac=None,
-                            timestep='hourly'):
+    def merge_obs_and_constraint(self, constraints, station_targets, var,
+                                 fine_input, baseline_density=0.25):        
+        X1 = np.where(np.ones((constraints.shape[0], constraints.shape[1])))
+        X1 = np.hstack([X1[0][...,np.newaxis],
+                        X1[1][...,np.newaxis]])
+        kernel1 = RBF(40) # location
+        if 'TA' in var or 'PA' in var:
+            X2 = (fine_input[:,:,self.fine_variable_order.index("elev")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            kernel2 = RBF(0.15) # elev
+        if 'SWIN' in var:
+            X2 = (fine_input[:,:,self.fine_variable_order.index("shade_map")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            X3 = (fine_input[:,:,self.fine_variable_order.index("solar_altitude")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            X4 = (fine_input[:,:,self.fine_variable_order.index("cloud_cover")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            kernel2 = RBF(0.25) # terrain shading
+            kernel3 = RBF(0.25) # solar altitude
+            kernel4 = RBF(0.25) # cloud cover
+        if 'LWIN' in var:
+            X2 = (fine_input[:,:,self.fine_variable_order.index("TA")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            X3 = (fine_input[:,:,self.fine_variable_order.index("cloud_cover")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )            
+            kernel2 = RBF(0.1) # TA
+            kernel3 = RBF(0.15) # cloud cover
+        if 'WS' in var:
+            X2 = (fine_input[:,:,self.fine_variable_order.index("elev")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            
+            kernel2 = RBF(1.5) # elevation            
+        if 'RH' in var:
+            X2a = (fine_input[:,:,self.fine_variable_order.index("TA")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            X2b = (fine_input[:,:,self.fine_variable_order.index("PA")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            X2 = np.hstack([X2a, X2b])
+            del(X2a)
+            del(X2b)            
+            kernel2 = RBF(1) # Temp/Pres
+        if 'PRECIP' in var:
+            X2 = (fine_input[:,:,self.fine_variable_order.index("cloud_cover")].numpy()
+                .reshape((fine_input.shape[0]*fine_input.shape[1],1))
+            )
+            kernel1 = RBF(25) # location
+            kernel2 = RBF(0.15) # cloud cover
+        
+        thisvar = ['UX', 'VY'] if var[0]=='WS' else var
+        interleaved_out = []
+        for j, vv in enumerate(thisvar):
+            density = np.zeros((1, constraints.shape[0]*constraints.shape[1]), dtype=np.float32)
+            value = np.zeros((1, constraints.shape[0]*constraints.shape[1]), dtype=np.float32)
+            for i in range(station_targets.shape[0]):
+                site_dat = station_targets.iloc[i].copy()
+                site_dat[['sub_y', 'sub_x']] = site_dat[['sub_y', 'sub_x']]                
+                density1 = kernel1(site_dat[['sub_y', 'sub_x']].values, X1)
+                if 'TA' in var or 'PA' in var or 'WS' in var:
+                    site_dat['ALTITUDE'] = (site_dat['ALTITUDE'] - nm.s_means.elev) / nm.s_stds.elev
+                    
+                    density2 = kernel2(site_dat[['ALTITUDE']].values, X2)
+                    this_density = density1 * density2
+                if 'SWIN' in var:
+                    site_shading = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("shade_map")]
+                    site_solarelev = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("solar_altitude")]
+                    site_cloud = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("cloud_cover")]
+
+                    density2 = kernel2(site_shading, X2)
+                    density3 = kernel3(site_solarelev, X3)
+                    density4 = kernel4(site_cloud, X4)
+                    this_density = density1 * density2 * density3 * density4
+                if 'LWIN' in var:
+                    site_TA = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("TA")]
+                    site_cloud = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("cloud_cover")]
+                    
+                    density2 = kernel2(site_TA, X2)
+                    density3 = kernel3(site_cloud, X3)        
+                    this_density = density1 * density2 * density3
+                if 'RH' in var:
+                    site_TA = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("TA")]
+                    site_PA = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("PA")]        
+
+                    density2 = kernel2(np.hstack([site_TA, site_PA]), X2)
+                    this_density = density1 * density2
+                if 'PRECIP' in var:
+                    site_cloud = fine_input[int(site_dat.sub_y), int(site_dat.sub_x), self.fine_variable_order.index("cloud_cover")]
+                    
+                    density2 = kernel2(site_cloud, X2)
+                    this_density = density1 * density2
+                    
+                this_density = this_density / this_density.max()
+                this_value = site_dat[vv]
+
+                density += this_density
+                value += this_value * this_density
+                
+            density = density[0,:].reshape(constraints.shape[0], constraints.shape[1])
+            value = value[0,:].reshape(constraints.shape[0], constraints.shape[1])
+                        
+            # combining era5 interp constraint with point obs using baseline min density for constraint            
+            density = density + baseline_density
+            value = value + constraints.numpy()[:,:,j] * baseline_density
+            
+            value = value / density
+            density = density / density.max()
+            interleaved_out.append(torch.from_numpy(value))
+            interleaved_out.append(torch.from_numpy(density))
+        return torch.stack(interleaved_out, dim=-1).to(torch.float32)
+
+    def get_station_targets(self, subdat, x_inds, y_inds, timestamp, var,
+                            batch_type='train', trim_edge_sites=True,
+                            context_frac=None, timestep='hourly'):
         # get station targets within the dim_l x dim_l tile,
         # ignoring stations on edge pixels       
         if trim_edge_sites:
@@ -1297,7 +1374,6 @@ class data_generator():
             station_npts = sites_npts[var]
         station_targets = contained_sites[keep_vars]
         
-        
         # trim sites with no data
         if var[0]=='WS':
             keepsites = station_targets[['UX', 'VY']].dropna().index
@@ -1305,25 +1381,6 @@ class data_generator():
             keepsites = station_targets[var].dropna(how='all').index
         station_targets = station_targets.loc[keepsites]
         station_npts = station_npts.loc[keepsites]
-        
-        if timestep=='daily':
-            # mask vars at sites with fewer than 24 readings for daily data
-            keepsites2 = []
-            for v in var:
-                keepsites2 += list(station_npts[station_npts[v]==24].index)
-                nansites_v = station_npts[station_npts[v]<24].index
-                station_targets.loc[nansites_v, v] = np.nan
-            keepsites2 = list(set(keepsites2))
-            station_targets = station_targets.loc[keepsites2]
-            station_npts = station_npts.loc[keepsites2]
-            
-            if len(keepsites2)==0:
-                # no sites with 24 readings, return null batch                
-                val_dense_vecs = np.zeros((1, 2*len(var) + 3, 0), dtype=np.float32) # no null tag
-                YX_locs = np.zeros((0,2), dtype=np.float32)
-                return ({'context':station_targets, 'target':station_targets},
-                         {'context':station_npts, 'target':station_npts},
-                         val_dense_vecs, YX_locs)
                 
         # create context/target splits (randomising context fraction)
         if context_frac is None:
@@ -1334,93 +1391,13 @@ class data_generator():
             random_state=np.random.randint(1000)
         )
         
-        # create value/density pairs (+ altitude) vector for context points
+        # OLD: create value/density pairs (+ altitude) vector for context points
         if var[0]=='WS':
             self.context_variable_order = ['var_value_u', 'var_value_v', 'elev', 'lat', 'lon']
         else:
-            self.context_variable_order = ['var_value', 'elev', 'lat', 'lon']
-            
-        if var[0]=='SWIN':
-            val_dense_vecs = np.zeros((1, 7, len(context)), dtype=np.float32) # add illum map, shade map, cloud cover
-            cloud_vec = []
-            shade_vec = []
-            illum_vec = []
-            self.context_variable_order = self.context_variable_order + ['cloud_cover', 'shade_map', 'illumination_map']
-        elif var[0]=='LWIN' or var[0]=='PRECIP':
-            val_dense_vecs = np.zeros((1, 5, len(context)), dtype=np.float32)
-            cloud_vec = []
-            self.context_variable_order = self.context_variable_order + ['cloud_cover']
-        elif var[0]=='WS':
-            val_dense_vecs = np.zeros((1, 2*len(var) + 3, len(context)), dtype=np.float32)
-        else:
-            val_dense_vecs = np.zeros((1, len(var) + 3, len(context)), dtype=np.float32)
-        
-        for i, sid in enumerate(context):
-            vardat = station_targets.loc[sid]
-            if var[0]=='WS':
-                val_dense_vecs[0,0,i] = vardat['UX']
-                val_dense_vecs[0,1,i] = vardat['VY']
-                jj = 2
-            else:
-                val_dense_vecs[0,0,i] = vardat[var[0]]
-                jj = 1
-            
-            val_dense_vecs[0,jj  ,i] = (vardat.ALTITUDE - nm.s_means.elev) / nm.s_stds.elev
-            val_dense_vecs[0,jj+1,i] = vardat.LATITUDE / nm.lat_norm
-            val_dense_vecs[0,jj+2,i] = vardat.LONGITUDE / nm.lon_norm
-            
-            if var[0]=='SWIN' or var[0]=='LWIN' or var[0]=='PRECIP':
-                val_dense_vecs[0,jj+3,i] = fine_input[int(vardat.sub_y), int(vardat.sub_x), self.fine_variable_order.index('cloud_cover')]
-                cloud_vec.append(val_dense_vecs[0,jj+3,i])
-                             
-            if var[0]=='SWIN':
-                
-                val_dense_vecs[0,jj+4,i] = fine_input[int(vardat.sub_y), int(vardat.sub_x), self.fine_variable_order.index('shade_map')]
-                shade_vec.append(val_dense_vecs[0,jj+4,i])
-                
-                val_dense_vecs[0,jj+5,i] = fine_input[int(vardat.sub_y), int(vardat.sub_x), self.fine_variable_order.index('illumination_map')]
-                illum_vec.append(val_dense_vecs[0,jj+5,i])                
-
-        if var[0]=='SWIN' or var[0]=='LWIN' or var[0]=='PRECIP':
-            station_targets = station_targets.assign(cloud_cover = np.nan)
-            station_targets.loc[context, 'cloud_cover'] = cloud_vec
-        if var[0]=='SWIN':
-            station_targets = station_targets.assign(shade_map = np.nan)
-            station_targets.loc[context, 'shade_map'] = shade_vec
-            station_targets = station_targets.assign(illumination_map = np.nan)
-            station_targets.loc[context, 'illumination_map'] = illum_vec
-            
-        if False:
-            ## find off-grid YX locations of stations 
-            ## (as floating point indices for positional encoding)
-            lats  = station_targets.loc[context].LATITUDE / nm.lat_norm
-            lons  = station_targets.loc[context].LONGITUDE / nm.lon_norm
-            lls = pd.concat([lats, lons], axis=1).values
-            latlon_grid = np.reshape(latlon_grid, (2, len(x_inds)*len(y_inds))).T #self.dim_h*self.dim_h
-            
-            neigh = NearestNeighbors(n_neighbors=4)
-            neigh.fit(latlon_grid)
-            dists, inds = neigh.kneighbors(X=lls)
-            
-            weights = 1 - (dists / dists.sum(axis=1, keepdims=True))
-            
-            if len(x_inds)==self.dim_h and len(y_inds)==self.dim_h:
-                X1 = self.X1
-            else:
-                X1 = np.where(np.ones((len(y_inds), len(x_inds))))
-                X1 = np.hstack([X1[0][...,np.newaxis],
-                                X1[1][...,np.newaxis]])
-            YX_locs = np.stack([(X1[inds][s] * weights[s][...,None]).sum(axis=0) / weights[s].sum() for s in range(weights.shape[0])])
-        else:
-            YX_locs = np.zeros((0,2), dtype=np.float32)
-        
-        if False:
-            # if we want to scale or mask the attention by distance:
-            nbrs = NearestNeighbors(n_neighbors = X0.shape[0], algorithm='ball_tree').fit(X0)
-            distances, indices = nbrs.kneighbors(self.X1)
-            # these are ordered by nearest rather than in order of X0, so 
-            # reorder by indices vectors
-            distances = np.take_along_axis(distances, np.argsort(indices, axis=1), axis=1)
+            self.context_variable_order = ['var_value', 'elev', 'lat', 'lon']            
+        val_dense_vecs = np.zeros((1, len(var) + 3, len(context)), dtype=np.float32)            
+        YX_locs = np.zeros((0,2), dtype=np.float32)
         
         # return station data/npts, value/density array and locations
         return ({'context':station_targets.loc[context],
@@ -1445,8 +1422,8 @@ class data_generator():
                 self.parent_pixels['hourly'][self.var_name_map.loc['SWIN'].coarse][it,:,:] * nm.swin_norm, # de-nornmalise!
                 self.fine_grid,
                 self.sp,
-                self.parent_pixels['hourly'][self.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu, # de-nornmalise!
-                self.p_1km_elev[it,:,:],
+                #self.parent_pixels['hourly'][self.var_name_map.loc['PA'].coarse][it,:,:] * nm.p_sd + nm.p_mu, # de-nornmalise!
+                #self.p_1km_elev[it,:,:],
                 self.height_grid,
                 self.shading_ds.isel(time=it),                
                 self.scale,
@@ -1461,13 +1438,8 @@ class data_generator():
             c = self.Lw_1km.isel(time=it, y=y_inds, x=x_inds)
             c.values = (c.values - nm.lwin_mu) / nm.lwin_sd
             constraint['LWIN'] = c.values.copy()
-        if 'WS' in var:
-            '''
-            Grab both wind components here and stack them on channel dim
-            '''
-            # c = self.ws_1km_interp.isel(time=it, y=y_inds, x=x_inds)
-            # c.values = (c.values - nm.ws_mu) / nm.ws_sd
-            # constraint['WS'] = c.values.copy()
+        if 'WS' in var:            
+            # Grab both wind components here and stack them on channel dim
             c_x = self.ux_1km_interp.isel(time=it, y=y_inds, x=x_inds)            
             c_x.values = c_x.values / nm.ws_sd
             c_y = self.vy_1km_interp.isel(time=it, y=y_inds, x=x_inds)
@@ -1479,23 +1451,27 @@ class data_generator():
             c.values = (c.values - nm.rh_mu) / nm.rh_sd
             constraint['RH'] = c.values.copy()
         if 'PRECIP' in var:
-            ## LOAD CEH-GEAR data for the date/time, or do this prior
-            ## to share dataset between same-day timepoints            
-            fine_sub = self.fine_grid.isel(y=y_inds, x=x_inds)         
-            c = (self.gear.sel(y=fine_sub.y, x=fine_sub.x)
-                .isel(time=it)
-                .rainfall_amount
-            )
-            # infill sea NaNs with ERA5 precip interp, might need to transform precip interp to mm
-            sea_mask = np.isnan(c.values)
-            c.values[sea_mask] = (self.precip_1km_interp
-                .isel(y=y_inds, x=x_inds, time=it)
-                .values[sea_mask]
-            ) * 3600 # kg m2 s-1 to mm
+            if False:
+                ## LOAD CEH-GEAR data for the date/time, or do this prior
+                ## to share dataset between same-day timepoints            
+                fine_sub = self.fine_grid.isel(y=y_inds, x=x_inds)         
+                c = (self.gear.sel(y=fine_sub.y, x=fine_sub.x)
+                    .isel(time=it)
+                    .rainfall_amount
+                )
+                # infill sea NaNs with ERA5 precip interp, might need to transform precip interp to mm
+                sea_mask = np.isnan(c.values)
+                c.values[sea_mask] = (self.precip_1km_interp
+                    .isel(y=y_inds, x=x_inds, time=it)
+                    .values[sea_mask]
+                ) * 3600 # kg m2 s-1 to mm
+            else:
+                # or just take the interped ERA5 precip
+                c = self.precip_1km_interp.isel(time=it, y=y_inds, x=x_inds) * 3600
+            
             c.values = c.values / nm.precip_norm
             c = c.clip(min=0) # get rid of negative rain
             constraint['PRECIP'] = c.values.copy()
-                        
         return [torch.from_numpy(constraint[v]).to(torch.float32) for v in constraint.keys()]
 
     def get_sample(self, var, batch_type='train',
@@ -1504,7 +1480,8 @@ class data_generator():
                    sample_xyt=True,
                    ix=None, iy=None, it=None,
                    return_constraints=True,
-                   SID=None, parent_pixel_id=None):
+                   SID=None, parent_pixel_id=None,
+                   baseline_density=0.25):
 
         if sample_xyt:
             ## sample a dim_l x dim_l tile
@@ -1512,42 +1489,63 @@ class data_generator():
                                          timestep=timestep,
                                          SID=SID,
                                          parent_pixel_id=parent_pixel_id,
-                                         it=it)
-        
+                                         it=it)        
         if it is None: it = 0 # hack for daily
         
-        ## load input data
-        (coarse_input, fine_input, subdat,
-            x_inds, y_inds, lat_grid, lon_grid, timestamp) = self.get_input_data(
-            var, ix, iy, it, timestep=timestep
+        ## trim down the full region
+        subdat, x_inds, y_inds, timestamp = self.get_subset_region(
+            it, var=var, ix=ix, iy=iy, timestep=timestep
         )
+                
+        ## use physically reasoned constraints
+        constraints = self.get_constraints(x_inds, y_inds, it, var)
+        constraints = torch.stack(constraints, dim=-1)
         
         ## get station targets within the dim_l x dim_l tile        
         (station_targets, station_npts, 
             station_data, context_locations) = self.get_station_targets(
-            subdat, x_inds, y_inds, timestamp, var,
-            np.stack([lat_grid, lon_grid], axis=0),
-            fine_input,
+            subdat, x_inds, y_inds, timestamp, var,            
             batch_type=batch_type,
             context_frac=context_frac,            
             timestep=timestep            
         )
         
-        constraints = []
-        if return_constraints:
-            if timestep=='daily':
-                ## grab subgrid chess constraints                
-                for v in list(self.var_name_map.loc[var].chess):
-                    constraints.append(torch.from_numpy(
-                        self.chess_dat.isel(x=x_inds, y=y_inds)[v].values)
-                        .to(torch.float32)
-                    )
-            else:
-                ## use physically reasoned constraints
-                constraints = self.get_constraints(x_inds, y_inds, it, var)               
+        ## load input data
+        (coarse_input, fine_input, lat_grid, lon_grid) = self.get_input_data(
+            var, subdat, x_inds, y_inds, it, timestep=timestep
+        )
+        
+        ## deal with constraint and observations
+        if 'WS' in var:
+            cnames = ['constraint_ux', 'constraint_vy']
         else:
-            constraints.append(torch.zeros((0,0)).to(torch.float32))
-        constraints = torch.stack(constraints, dim=-1)
+            cnames = ['constraint']
+        
+        # if 'PRECIP' in var or 'SWIN' in var:
+        # do use value and density merged from observations
+        input_constraint = self.merge_obs_and_constraint(
+            constraints,
+            station_targets['context'],
+            var,
+            fine_input,
+            baseline_density=baseline_density
+        )
+        self.fine_variable_order += [f+'_'+s for f in cnames for s in ['raw', 'val', 'dens']]
+        # else:
+            # don't use value / density merged from observations
+            # input_constraint = constraints.clone()
+            # self.fine_variable_order += cnames
+        
+        # add constraint fields as extra input
+        #fine_input = torch.cat([fine_input, input_constraint], dim=-1)
+        fine_input = torch.cat([fine_input, constraints, input_constraint], dim=-1)
+        
+        # add lat/lon (always last two finescale inputs
+        fine_input = torch.cat([fine_input,                            
+                            torch.from_numpy(lat_grid).to(torch.float32)[...,None],
+                            torch.from_numpy(lon_grid).to(torch.float32)[...,None]
+                            ], dim = -1)
+        self.fine_variable_order += ['lat', 'lon']
         
         ## capture sample description
         sample_meta = {
@@ -1646,13 +1644,13 @@ class data_generator():
                 self.rh_1km_interp.load()
                 self.rh_1km_interp = reflect_pad_nans(self.rh_1km_interp.copy())
                 
-                # rescale to counteract errors in physical downscaling assumptions
-                self.rh_1km_interp = scale_by_coarse_data(
-                    self.rh_1km_interp.copy(),
-                    self.parent_pixels['hourly'][self.var_name_map.loc['RH'].coarse],
-                    self.fine_grid,
-                    self.scale
-                )
+                # # rescale to counteract errors in physical downscaling assumptions
+                # self.rh_1km_interp = scale_by_coarse_data(
+                    # self.rh_1km_interp.copy(),
+                    # self.parent_pixels['hourly'][self.var_name_map.loc['RH'].coarse],
+                    # self.fine_grid,
+                    # self.scale
+                # )
             
             if 'SWIN' in var:
                 ## Shortwave radiation, relies on time-specific
@@ -1729,23 +1727,7 @@ class data_generator():
                 ## Wind speed. Simply interpolate this....
                 '''
                 Interpolate both components, u10 and v10!
-                '''         
-                # self.ws_1km_interp = interp_to_grid(
-                    # self.parent_pixels['hourly'][self.var_name_map.loc['WS'].coarse],
-                    # self.fine_grid, coords=['lat', 'lon']
-                # )
-                # self.ws_1km_interp = self.ws_1km_interp.transpose('time', 'y', 'x')
-                # self.ws_1km_interp.load()
-                # self.ws_1km_interp = reflect_pad_nans(self.ws_1km_interp.copy())
-                
-                # # rescale to counteract errors in physical downscaling assumptions
-                # self.ws_1km_interp = scale_by_coarse_data(
-                    # self.ws_1km_interp.copy(),
-                    # self.parent_pixels['hourly'][self.var_name_map.loc['WS'].coarse],
-                    # self.fine_grid,
-                    # self.scale
-                # )
-                
+                '''                
                 self.ux_1km_interp = interp_to_grid(
                     self.parent_pixels['hourly'][self.var_name_map.loc['UX'].coarse],
                     self.fine_grid, coords=['lat', 'lon']
@@ -1825,11 +1807,7 @@ class data_generator():
         ## load other large grids that we only want to load once per batch
         if 'SWIN' in var:
             # terrain shading used in hourly AND daily
-            doy = self.td.day_of_year - 1 # zero indexed
-            # self.shading_array = np.load(
-                # nz_train_path + f'/terrain_shading/shading_mask_day_{doy}_merged_to_7999.npy')
-            # self.sea_shading_array = np.load(
-                # nz_train_path + f'/terrain_shading/sea_shading_mask_day_{doy}_merged_to_7999.npy')
+            doy = self.td.day_of_year - 1 # zero indexed            
             self.shading_ds = xr.open_dataset(nz_train_path + f'./terrain_shading/shading_mask_{doy}.nc')
             self.shading_ds = self.shading_ds.shading
                 
@@ -1840,18 +1818,20 @@ class data_generator():
             self.tcc_1km = reflect_pad_nans(self.tcc_1km.copy())
         
         if ('PRECIP' in var):
-            self.gear = xr.open_dataset(precip_fldr + f'/{self.td.year}/CEH-GEAR-1hr-v2_{self.td.year}{zeropad_strint(self.td.month)}.nc')
-            # label centre of pixel
-            self.gear['x'] = self.gear.x + 500
-            self.gear['y'] = self.gear.y + 500
-            # subset to domain
-            self.gear = self.gear.sel(
-                x = np.intersect1d(self.gear.x, self.fine_grid.x),
-                y = np.intersect1d(self.gear.y, self.fine_grid.y)
-            )
-            # subset to day
-            day_inds = np.where(pd.to_datetime(self.gear.time.values, utc=True).day == self.td.day)[0]
-            self.gear = self.gear.isel(time = day_inds)
+            pass
+            if False:
+                self.gear = xr.open_dataset(precip_fldr + f'/{self.td.year}/CEH-GEAR-1hr-v2_{self.td.year}{zeropad_strint(self.td.month)}.nc')
+                # label centre of pixel
+                self.gear['x'] = self.gear.x + 500
+                self.gear['y'] = self.gear.y + 500
+                # subset to domain
+                self.gear = self.gear.sel(
+                    x = np.intersect1d(self.gear.x, self.fine_grid.x),
+                    y = np.intersect1d(self.gear.y, self.fine_grid.y)
+                )
+                # subset to day
+                day_inds = np.where(pd.to_datetime(self.gear.time.values, utc=True).day == self.td.day)[0]
+                self.gear = self.gear.isel(time = day_inds)
             
         ## change units
         self.parent_pixels[tstep]['t2m'].values -= 273.15 # K -> Celsius 
@@ -1933,21 +1913,10 @@ class data_generator():
         if fmi:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                if batch_tsteps!='hourly': # cover daily and mix
-                    ## interpolate ERA5 extra vars to 1km and replace
-                    ## NaN sea pixels of chess vars with ERA5 to use as fine input
-                    era5_met = self.parent_pixels['daily'].copy()#.drop(['pixel_id'])                    
-                    era5_met = interp_to_grid(era5_met, self.fine_grid, coords=['lat', 'lon'])
-                    for vv in list(era5_met.keys()):
-                        era5_met[vv] = reflect_pad_nans(era5_met[vv].copy())
-                    chess_sea_mask = np.isnan(self.chess_dat[self.chess_var[0]].values)
-                    for xtrvar in extra_met_vars:
-                        self.chess_dat[self.var_name_map.loc[xtrvar].chess].values[chess_sea_mask] =\
-                            era5_met[self.var_name_map.loc[xtrvar].coarse].values[chess_sea_mask]
                 if batch_tsteps!='daily': # covers hourly and mix
                     ## use hi-res constraints for land pixels and replace
                     ## NaN sea pixels with ERA5 to use as fine input                    
-                    self.met_fine = self.parent_pixels['hourly'].copy()#.drop(['pixel_id'])                    
+                    self.met_fine = self.parent_pixels['hourly'].copy()              
                     self.met_fine = interp_to_grid(self.met_fine, self.fine_grid, coords=['lat', 'lon'])
                     for vv in list(self.met_fine.keys()):
                         self.met_fine[vv] = reflect_pad_nans(self.met_fine[vv].copy())
@@ -2013,7 +1982,8 @@ class data_generator():
     
     def get_batch(self, var, batch_size=1, batch_type='train',
                   context_frac=None, p_hourly=1,
-                  date=None, parent_pixel_ids=[], times=[]):
+                  date=None, parent_pixel_ids=[], times=[],
+                  baseline_density=0.25):
         ''' 
         when using date, parent_pixel_ids, times to select batches,
         date must be a datetime.date object
@@ -2038,12 +2008,7 @@ class data_generator():
         ## work out the timesteps of the batch        
         batch_timesteps = np.random.choice(['daily', 'hourly'], batch_size,
                                            p=[1-p_hourly, p_hourly])
-        if ('daily' in batch_timesteps) and ('hourly' in batch_timesteps):
-            batch_tsteps = 'mix'
-        elif batch_timesteps[0]=='daily':
-            batch_tsteps = 'daily'
-        else:
-            batch_tsteps = 'hourly'
+        batch_tsteps = 'hourly'
 
         if (batch_tsteps!='hourly'):
             ## load chess data (don't normalise in case using in constraint preparation)
@@ -2054,25 +2019,8 @@ class data_generator():
         ## process and normalise ERA5 parent_pixels
         self.prepare_era5_pixels(var, batch_tsteps=batch_tsteps)
 
-        if (batch_tsteps!='hourly'):
-            ## now normalise if we have loaded chess data
-            self.chess_dat = normalise_chess_data(self.chess_dat.copy(),
-                                                  self.chess_var)
-
         ## get additional fine scale met vars for input
         self.prepare_fine_met_inputs(var, batch_tsteps)
-        
-        if batch_tsteps!='hourly': # cover daily and mix
-            # pool to scale and fill in the parent pixels
-            for v in var:
-                cv = self.var_name_map.loc[v].chess
-                ev = self.var_name_map.loc[v].coarse
-                chess_pooled = pooling(self.chess_dat[cv].values, (self.scale, self.scale), method='mean')
-                chess_mask = ~np.isnan(chess_pooled)
-                self.parent_pixels['daily'][ev].values[chess_mask] = chess_pooled[chess_mask]   
-            
-            # solar values for daily timestep
-            self.calculate_day_av_solar_vars(var)
         
         coarse_inputs = []
         fine_inputs = []
@@ -2099,7 +2047,8 @@ class data_generator():
                                      context_frac=context_frac,
                                      timestep=batch_timesteps[b],
                                      parent_pixel_id=ppid,
-                                     it=_it)
+                                     it=_it,                                     
+                                     baseline_density=baseline_density)
            
             # append to storage
             coarse_inputs.append(sample['in_coarse'])            
@@ -2131,7 +2080,8 @@ class data_generator():
     def get_all_space(self, var, batch_type='run',
                       context_frac=None, date_string=None, it=None,
                       timestep='hourly', tile=False, min_overlap=1,
-                      return_constraints=False):
+                      return_constraints=False,
+                      baseline_density=0.25):
         
         if type(var)==str: var = [var]
         self.parent_pixels = {}
@@ -2205,7 +2155,8 @@ class data_generator():
                                          timestep=timestep,
                                          sample_xyt=False,
                                          ix=ix, iy=iy, it=it,
-                                         return_constraints=return_constraints)
+                                         return_constraints=return_constraints,                                         
+                                         baseline_density=baseline_density)
                 
                 # append to storage
                 coarse_inputs.append(sample['in_coarse'])            
@@ -2254,7 +2205,7 @@ class data_generator():
         # output tensors as (B, C, Y, X)
         return {'coarse_inputs':coarse_inputs.permute(0,3,1,2),
                 'fine_inputs':fine_inputs.permute(0,3,1,2),
-                'constraints':constraint_targets.permute(0,3,1,2),       
+                'constraints':constraint_targets.permute(0,3,1,2),
                 'station_targets':station_targets,
                 'station_data':station_data,
                 'station_num_obs':station_num_obs,
@@ -2263,155 +2214,3 @@ class data_generator():
                 'ixs':ixs, 'iys':iys
                }
 
-
-if __name__=="__main__":
-    if False:
-        pass
-        dg = data_generator(precip_sutes=True)
-        
-        batch_size = 3
-        batch_type = 'train'
-        p_hourly = 1.0
-        #var = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
-        var = 'WS'
-                
-        batch = dg.get_batch(var,
-                           batch_size=batch_size,
-                           batch_type=batch_type,
-                           p_hourly=p_hourly)            
-
-        b = 4
-        print(batch['batch_metadata'][b]['t_ind'])
-        fig, ax = plt.subplots(1, 2)
-        ax[0].imshow(batch['coarse_inputs'].cpu().numpy()[b,0,::-1,:])
-        ax[1].imshow(batch['constraints'].cpu().numpy()[b,0,::-1,:])
-        plt.show()
-    
-        #############################################
-        #############################################
-        ## create dictionaries of dates/times that contain 
-        ## representative samples for a spread of quantikes
-        ## for each variable so we can create balanced batches
-        dg = data_generator(precip_sites=True)
-        all_site_data = pd.DataFrame()
-        submeta = dg.site_metadata[['SITE_ID', 'chess_y', 'chess_x', 'parent_pixel_id']]
-        submeta.loc[:,'parent_pixel_id'] = submeta['parent_pixel_id'].astype(np.int32)
-        sites = list(dg.site_data.keys())
-        for sid in sites:
-            site_dat = (dg.site_data.pop(sid)
-                .dropna(how='all')
-                .assign(SITE_ID=sid)
-                .reset_index() # [['DATE_TIME', 'SITE_ID', 'PRECIP']]
-            )
-            site_dat = site_dat.merge(submeta, on='SITE_ID', how='left') 
-            all_site_data = pd.concat([all_site_data, site_dat], axis=0)        
-        
-        # look at quantiles of variables
-        # qs = {}
-        # qlist = [0, 0.025, 0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.95, 0.975, 1]
-        # for qq in qlist:
-            # qs[str(qq)] = all_site_data[list(dg.var_name_map.fine)].quantile(qq)            
-        
-        # define larger pixels to merge when defining dates/sites to pull from        
-        big_pixels = pd.DataFrame()
-        bp_i = 0
-        for i in range(20):
-            for j in range(20):
-                bps = np.unique(dg.fine_grid.era5_nbr.values[(i*200):((i+1)*200), # arbitrary 200 big pixel
-                                                             (j*200):((j+1)*200)])
-                if len(bps)>0:
-                    thisdf = pd.DataFrame({'parent_pixel_id':bps}).assign(big_pixel_id = bp_i)
-                    big_pixels = pd.concat([big_pixels, thisdf], axis=0)
-                    bp_i += 1
-        big_pixels = big_pixels.dropna()
-        dg.site_metadata = dg.site_metadata.merge(big_pixels, on='parent_pixel_id', how='left')
-        
-        outdir = nz_train_path + '/var_quantile_samples/'
-        
-        for v in ['TA', 'PA', 'LWIN', 'WS', 'RH']:
-            TT = (all_site_data[['DATE_TIME', 'SITE_ID', 'parent_pixel_id', v]]
-                .dropna()
-                .sort_values(v)
-                .reset_index(drop=True))
-            l1 = TT.shape[0] // 40 # delta_q = 0.025
-            l2 = TT.shape[0] // 20 # delta_q = 0.05
-            l3 = TT.shape[0] // 10 # delta_q = 0.1
-            l4 = 3* (TT.shape[0] // 10) # delta_q = 0.3
-            lls = [l1, l1, l2, l3, l4, l4, l3, l2, l1, l1]
-            l0 = 0
-            for i in range(10):
-                if i<9:
-                    T_bin = TT.iloc[l0:(l0+lls[i])]
-                else:
-                    T_bin = TT.iloc[l0:]
-                pd.to_pickle(T_bin[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{i}.pkl', compression={'method': 'gzip', 'compresslevel': 5})
-                l0 += lls[i]
-        
-        v = 'SWIN'
-        TT = (all_site_data[['DATE_TIME', 'SITE_ID', 'parent_pixel_id', v]]
-            .dropna()
-            .sort_values(v)
-            .reset_index(drop=True))
-        TT_e0 = TT[TT[v] == 0]
-        TT = TT[TT[v] > 0]
-        
-        # cut down to manageable number of zeros
-        TT_e0 = TT_e0.sample(int(1e6), replace=False)
-        pd.to_pickle(TT_e0[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{0}.pkl', compression={'method': 'gzip', 'compresslevel': 5})
-        l1 = TT.shape[0] // 40
-        l2 = TT.shape[0] // 20
-        l3 = TT.shape[0] // 10
-        l4 = 3* (TT.shape[0] // 10)
-        lls = [0, l2, l2, l3, l4, l4, l3, l2, l1, l1]
-        l0 = 0
-        for i in range(1, 10):
-            if i<9:
-                T_bin = TT.iloc[l0:(l0+lls[i])]
-            else:
-                T_bin = TT.iloc[l0:]
-            pd.to_pickle(T_bin[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{i}.pkl',
-                         compression={'method': 'gzip', 'compresslevel': 5})
-            l0 += lls[i]
-            
-        v = 'PRECIP'
-        TT = (all_site_data[['DATE_TIME', 'SITE_ID', 'parent_pixel_id', v]]
-            .dropna()
-            .sort_values(v)
-            .reset_index(drop=True))
-        TT_e0 = TT[TT[v] == 0]
-        TT = TT[TT[v] > 0]
-        
-        # cut down to manageable number of zeros
-        TT_e0 = TT_e0.sample(int(1e6), replace=False)
-        pd.to_pickle(TT_e0[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{0}.pkl', compression={'method': 'gzip', 'compresslevel': 5})
-        # define uneven quantile bins to capture extreme events
-        l1 = TT.shape[0] // 40
-        l2 = TT.shape[0] // 20
-        l3 = TT.shape[0] // 10
-        l4 = 3 * (TT.shape[0] // 10)
-        lls = [0, l2, l2, l3, l4, l4, l3, l2, l1, l1]
-        l0 = 0
-        for i in range(1, 10):
-            if i<9:
-                T_bin = TT.iloc[l0:(l0+lls[i])]
-            else:
-                T_bin = TT.iloc[l0:]
-            pd.to_pickle(T_bin[['DATE_TIME', 'parent_pixel_id']], outdir + f'/{v}_bin_{i}.pkl',
-                         compression={'method': 'gzip', 'compresslevel': 5})
-            l0 += lls[i]
-        
-        for vv in ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']:
-            for nbin in range(10):
-                dat = pd.read_pickle(outdir + f'/{vv}_bin_{nbin}.pkl',
-                                     compression={'method': 'gzip', 'compresslevel': 5})
-                dat = dat.sort_values('DATE_TIME')
-                pd.to_pickle(dat[dat['DATE_TIME'].dt.year.isin(dp.train_years)],
-                             outdir + f'/{vv}_bin_{nbin}_train.pkl',
-                             compression={'method': 'gzip', 'compresslevel': 5})
-                pd.to_pickle(dat[dat['DATE_TIME'].dt.year.isin(dp.val_years)],
-                             outdir + f'/{vv}_bin_{nbin}_val.pkl',
-                             compression={'method': 'gzip', 'compresslevel': 5})
-                pd.to_pickle(dat[dat['DATE_TIME'].dt.year.isin(dp.heldout_years)],
-                             outdir + f'/{vv}_bin_{nbin}_test.pkl',
-                             compression={'method': 'gzip', 'compresslevel': 5})
-        

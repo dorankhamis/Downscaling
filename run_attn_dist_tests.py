@@ -89,7 +89,7 @@ datgen = data_generator()
 projdir = '/home/users/doran/projects/downscaling/'
 
 if __name__=="__main__":
-    var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH']
+    var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
     
     try:
         parser = argparse.ArgumentParser()        
@@ -187,8 +187,7 @@ if __name__=="__main__":
         model.eval()
         
         # load the 24 hour batches
-        tile = False
-        p_hourly = 1
+        tile = False        
         max_batch_size = 1
         context_frac = 1        
         date_string = f'{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}'        
@@ -200,24 +199,24 @@ if __name__=="__main__":
                                      timestep='hourly',
                                      tile=tile)
         batch = Batch(batch, var_list=var, device=device, constraints=False)
-        
         print(var)
         print(date_string)
         print(datgen.td)
         
-        # add target data to batch.raw_station_dict
+        # add target data to batch.raw_station_dict        
         for ii, dt in enumerate(tstamps):
             batch.raw_station_dict[ii]['target'] = (hourly_data.loc[dt]
                 .merge(datgen.site_metadata[['SITE_ID', 'chess_y', 'chess_x',
                                              'LONGITUDE', 'LATITUDE']],
                     on = 'SITE_ID', how='left')
                 .rename({'chess_y':'sub_y', 'chess_x':'sub_x'}, axis=1)
+                .set_index('SITE_ID')
             )
         
         ## loop over attention distance params
         '''
-        Sample dist_lim in [1, 250]
-        and    dist_pixpass in [1, 250]
+        Sample dist_lim in [1, 150]
+        and    dist_pixpass in [1, 150]
         and    poly_exp in [1, 10]
         in large steps to begin with
         '''
@@ -226,9 +225,9 @@ if __name__=="__main__":
         param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_paramsweep.csv'
         #param_sweep_out = outdir + f'/{var}_{year}{zeropad_strint(thismonth)}{zeropad_strint(thisday)}_zoomin_paramsweep.csv'
         
-        for dist_lim in [2, 10, 50, 100, 200]:
+        for dist_lim in [2, 5, 10, 20, 50, 75, 100, 150]:
             for poly_exp in [2, 4, 6, 8]:           
-                for dist_pixpass in [75, 100, 125]:
+                for dist_pixpass in [50, 75, 100, 125]:
 
                     masks = create_attention_masks(model, batch, var,
                                                    dist_lim = dist_lim,
@@ -245,19 +244,27 @@ if __name__=="__main__":
                         iinext = min(ii+max_batch_size, batch.coarse_inputs.shape[0])
 
                         # extract this timepoint from the masks lists
-                        context_masks = [[masks['context_masks'][r][ii]] for r in range(len(masks['context_masks']))]
-                        context_soft_masks = [[masks['context_soft_masks'][r][ii]] for r in range(len(masks['context_soft_masks']))]
-                        pixel_passer = [[masks['pixel_passers'][r][ii]] for r in range(len(masks['pixel_passers']))]
+                        #context_masks = [[masks['context_masks'][r][ii]] for r in range(len(masks['context_masks']))]
+                        #context_soft_masks = [[masks['context_soft_masks'][r][ii]] for r in range(len(masks['context_soft_masks']))]
+                        #pixel_passer = [[masks['pixel_passers'][r][ii]] for r in range(len(masks['pixel_passers']))]
+                        ''' FIX THIS '''
+                        masks = create_sample_attention_masks(model, batch, var, ii,
+                                                              dist_lim = dist_lim,
+                                                              dist_lim_far = None,
+                                                              attn_eps = None,
+                                                              poly_exp = poly_exp,
+                                                              diminish_model = None,
+                                                              dist_pixpass = dist_pixpass,
+                                                              pass_exp = None)
                         
-
                         with torch.no_grad():
                             out = model(batch.coarse_inputs[ii:iinext,...],
                                         batch.fine_inputs[ii:iinext,...],
                                         batch.context_data[ii:iinext],
                                         batch.context_locs[ii:iinext],
-                                        context_masks=context_masks,
-                                        context_soft_masks=context_soft_masks,
-                                        pixel_passers=pixel_passer)                
+                                        context_masks=masks['context_masks'],
+                                        context_soft_masks=masks['context_soft_masks'],
+                                        pixel_passers=masks['pixel_passers'])                
                         pred.append(out.cpu())            
                         del(out)            
                         ii += max_batch_size

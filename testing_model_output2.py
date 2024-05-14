@@ -30,7 +30,6 @@ var = 'SWIN'
 log_dir = './logs/'
 model_name = f'dwnsamp_{var}'
 model_outdir = f'{log_dir}/{model_name}/'
-Path(model_outdir).mkdir(parents=True, exist_ok=True)
 
 # training flags
 load_prev_chkpnt = True
@@ -86,6 +85,40 @@ for var in var_names:
     print(f'context variable order = {batch["batch_metadata"][0]["context_var_order"]}')
     
 
+############################
+var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
+for var in var_names:
+    print(var)
+    model_name = f'dwnsamp_{var}'
+    model_outdir = f'{log_dir}/{model_name}/'
+    specify_chkpnt = f'{model_name}/checkpoint.pth'
+                                  
+    ## create model              
+    model = SimpleDownscaler(
+        input_channels=model_pars.in_channels[var],
+        hires_fields=model_pars.hires_fields[var],
+        output_channels=model_pars.output_channels[var],
+        context_channels=model_pars.context_channels[var],
+        filters=model_pars.filters,
+        dropout_rate=model_pars.dropout_rate,
+        scale=data_pars.scale,
+        scale_factor=model_pars.scale_factor,
+        attn_heads=model_pars.attn_heads,
+        ds_cross_attn=model_pars.ds_cross_attn,
+        pe=model_pars.pe
+     )
+
+    ## load checkpoint
+    model, opt, chk = setup_checkpoint(model, None, device, load_prev_chkpnt,
+                                       model_outdir, log_dir,
+                                       specify_chkpnt=specify_chkpnt,
+                                       reset_chkpnt=reset_chkpnt)
+    plt.plot(chk['losses'])
+    plt.plot(chk['val_losses'])
+    plt.title(var)
+    plt.show()
+
+
 ###################################
 ## UK plots for all vars
 var_names = ['TA', 'PA', 'SWIN', 'LWIN', 'WS', 'RH', 'PRECIP']
@@ -111,10 +144,10 @@ for var in var_names:
                                   
     ## create model              
     model = SimpleDownscaler(
-        input_channels=batch['coarse_inputs'].shape[1],
-        hires_fields=batch['fine_inputs'].shape[1],
-        output_channels=batch['coarse_inputs'].shape[1],
-        context_channels=batch['station_data'][0].shape[1],
+        input_channels=model_pars.in_channels[var],
+        hires_fields=model_pars.hires_fields[var],
+        output_channels=model_pars.output_channels[var],
+        context_channels=model_pars.context_channels[var],
         filters=model_pars.filters,
         dropout_rate=model_pars.dropout_rate,
         scale=data_pars.scale,
@@ -135,8 +168,8 @@ for var in var_names:
     model.eval()
 
     # get tile(s) of whole UK
-    date_string = "20140101"
-    it = 10
+    date_string = "20140809" #"20140101"
+    it = 8 #10
     tile = False
     context_frac = 0.7
     constraints = True
@@ -152,13 +185,11 @@ for var in var_names:
     batch = Batch(batch, var_list=var, device=device, constraints=constraints)
     
     masks = create_attention_masks(model, batch, var,
-                                   dist_lim = None,
-                                   dist_lim_far = None,
-                                   attn_eps = None,
+                                   dist_lim = 30,
                                    poly_exp = None,
                                    diminish_model = None,
-                                   dist_pixpass = None,
-                                   pass_exp = None)
+                                   dist_pixpass = 100,
+                                   pass_exp = 6)
     
     if False:
         just_dist_masks = create_attention_masks(model, batch, "TA",

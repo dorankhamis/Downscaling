@@ -312,6 +312,7 @@ if __name__=="__main__":
             
                 
     if False:
+        ## Calculate sky view factor for each pixel
         ##############################
         home_data_dir = '/home/users/doran/data_dump/'
         hj_base = '/gws/nopw/j04/hydro_jules/'
@@ -401,6 +402,8 @@ if __name__=="__main__":
         # skyviewmap.values[:,:] = 0
         # skyviewmap.values[np.where(grid.landfrac.values == 0)] = svfs
         # skyviewmap.plot(); plt.show()
+
+
         
     if False:           
         ####################################

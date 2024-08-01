@@ -634,7 +634,7 @@ class data_generator():
         self.targ_var_depends['TA'] = ['elev', 'constraint']
         self.targ_var_depends['PA'] = ['elev', 'constraint']
         self.targ_var_depends['SWIN'] = ['elev', 'stdev',
-                                         'illumination_map',                                         
+                                         'illumination_map',           
                                          'solar_altitude',
                                          'cloud_cover',
                                          'constraint'] + self.swin_extra_met_vars
@@ -649,7 +649,7 @@ class data_generator():
                                            'cloud_cover',
                                            'aspect',
                                            'constraint_val',
-                                           'constraint_dens'] + self.precip_extra_met_vars        
+                                           'constraint_dens'] + self.precip_extra_met_vars
         
         ## deal with site data
         # load site metadata/locations
@@ -789,7 +789,7 @@ class data_generator():
 
                 # precipitation
                 self.site_data[SID].loc[:, 'PRECIP'] = self.site_data[SID].loc[:, 'PRECIP'] / nm.precip_norm
-                self.site_data[SID].loc[:, 'PRECIP'] = self.site_data[SID].loc[:, 'PRECIP'].clip(lower=0) # get rid of negative precip                
+                self.site_data[SID].loc[:, 'PRECIP'] = self.site_data[SID].loc[:, 'PRECIP'].clip(lower=0) # get rid of negative precip             
 
             # resample site data to daily and note number of data points present
             self.site_points_present = {}
@@ -1659,20 +1659,25 @@ class data_generator():
                 
             if 'LWIN' in var:
                 ## Saturated and Actual vapour pressure
-                # using Buck equation                
-                es_28km = 6.1121 * np.exp(
-                    (18.678 - (self.parent_pixels['hourly'][tn] - 273.15) / 234.5) *
-                    ((self.parent_pixels['hourly'][tn] - 273.15) / 
-                    (257.14 + (self.parent_pixels['hourly'][tn] - 273.15)))
+                # using Buck equation
+                Tref = 273.15
+                es_0 = 6.1121
+                exp_c1 = 18.678
+                T_c1 = 234.5
+                T_c2 = 257.14
+                es_28km = es_0 * np.exp(
+                    (exp_c1 - (self.parent_pixels['hourly'][tn] - Tref) / T_c1) *
+                    ((self.parent_pixels['hourly'][tn] - Tref) / 
+                    (T_c2 + (self.parent_pixels['hourly'][tn] - Tref)))
                 )
-                es_1km = 6.1121 * np.exp(
-                    (18.678 - (self.t_1km_elev - 273.15) / 234.5) *
-                    ((self.t_1km_elev - 273.15) / (257.14 + (self.t_1km_elev - 273.15)))
+                es_1km = es_0 * np.exp(
+                    (exp_c1 - (self.t_1km_elev - Tref) / T_c1) *
+                    ((self.t_1km_elev - Tref) / (T_c2 + (self.t_1km_elev - Tref)))
                 )
                 # from RH
                 ea_28km = (self.parent_pixels['hourly'][
-                    self.var_name_map.loc['RH'].coarse] / 100) * es_28km
-                ea_1km = (self.rh_1km_interp/100) * es_1km                
+                    self.var_name_map.loc['RH'].coarse] / 100.) * es_28km
+                ea_1km = (self.rh_1km_interp/100.) * es_1km                
                 
                 ## Longwave radiation and Emissivity
                 # method from Real-time and retrospective forcing in the North American Land
